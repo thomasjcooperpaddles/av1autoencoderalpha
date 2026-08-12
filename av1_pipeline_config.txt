@@ -1,0 +1,683 @@
+﻿# =====================================================================
+# AV1 Pipeline config
+# =====================================================================
+# One setting per line, written as   key = value
+# Anything after a # is a comment. Blank lines are ignored.
+# Paths are typed plainly. No quotes, no doubled backslashes.
+#
+# Edit this file with Notepad, save, and the change takes effect on the
+# next run. Both the pipeline and the GUI read this same file.
+#
+# A command line flag always beats what is written here.
+# =====================================================================
+
+# Where the source files are read from.
+src = P:\2_Storage\Film and TV\DownConvert\Input
+
+# Where the finished files are written.
+dst = P:\2_Storage\Film and TV\DownConvert\Output
+
+# Which encoder does the work.
+#   auto    test the GPU at startup, fall back to the CPU if it cannot
+#           encode AV1. This is the right setting for almost everyone.
+#   nvenc   force the GPU. The run stops if it will not encode AV1.
+#   svtav1  force the CPU encoder and skip the GPU test.
+# Only Ada (RTX 40) and newer NVIDIA cards can encode AV1 at all. On a
+# card that can, the GPU encoder still needs an ffmpeg build and a driver
+# that agree on the NVENC API version. When they do not, auto keeps the
+# batch moving on the CPU and switches back to the GPU on its own as
+# soon as the mismatch is resolved.
+encoder = nvenc
+
+# CPU encoder speed, 0 slowest and best through 13 fastest and worst.
+# 4 to 8 is the useful range. 6 is a good starting point. Every step
+# up roughly halves the encode time and costs a little quality.
+# Ignored when the GPU encoder is in use.
+svtav1_preset = 6
+
+# Folder holding a specific ffmpeg.exe and ffprobe.exe to use instead
+# of whichever one is on PATH. Leave blank for normal use.
+#
+# This is the lever for the NVENC API mismatch. ffmpeg builds sometimes
+# ship compiled against an NVENC SDK newer than any released driver
+# supports, and the GPU encoder then refuses to start even though the
+# card is perfectly capable. Unpack an older ffmpeg build somewhere and
+# point this at its bin folder to get the GPU back.
+# Example: ffmpeg_dir = C:\ffmpeg-7.1-full_build\bin
+ffmpeg_dir =
+
+# Where pipeline.log and av1_trace.log are written.
+# Leave this blank for the default, which is a logs folder inside the
+# output folder above. Put a path here to send them somewhere else.
+log_dir =
+
+# The run stops early if free space on the destination drive falls
+# below this many GB. Raise it if the drive fills up mid batch.
+min_free_gb = 20
+
+# How much of the processor a run may take, as a percentage of logical
+# cores. The work is pinned to that many cores and ffmpeg is told to
+# use no more, so the machine stays usable while a batch runs.
+#
+# On this 16 thread machine:
+#     88 = 14 cores (2 left free)   <- current
+#     80 = 12 cores (4 left free)
+#     75 = 12 cores
+#      0 or 100 = take everything
+# Encodes are slightly slower for it. Raise it if the desktop is idle
+# anyway, lower it if a run still gets in the way.
+cpu_max_pct = 88
+
+# Real-ESRGAN model used when a sub-1080 file gets upscaled.
+#   realesr-animevideov3    fast, best on animation and cartoons
+#   realesrgan-x4plus       slower, general purpose, live action
+#   realesrgan-x4plus-anime slower, tuned for anime line art
+sr_model = realesrgan-x4plus
+
+# Extra data rate for genuinely high quality sources, as a percentage.
+# A 4K 10-bit master carries far more real detail than a broadcast rip,
+# and squeezing it to the same quality number is what leaves visible
+# artifacts in the downscale. Only applies to sources at 2000 lines or
+# more that are also 10-bit. 0 turns it off.
+hq_source_boost_pct = 30
+
+# ---------------------------------------------------------------------
+# Metadata, naming, and tagging
+# ---------------------------------------------------------------------
+# Look the film up, write its details into the file, and rename it.
+# The folder structure is never changed; only the file is renamed, so a
+# file that escapes its folder still identifies itself.
+metadata_enable = 1
+
+# Free API key from https://www.themoviedb.org/settings/api
+# Without one, lookups are skipped and files keep their original names.
+tmdb_api_key = 4128f0600ff5a5b2846859615b173f83
+
+# Rename finished files from the metadata. 0 tags only.
+rename_files = 1
+
+# Confirm the identification with pictures, not just text. Frames are
+# sampled from the finished file and compared against TMDB's backdrops
+# and episode stills using a perceptual hash. A close match is real
+# evidence the file is what the name claims.
+#
+# There is no service that identifies a film from a frame - the tools
+# that appear to are web apps with no API - so this is done locally
+# against TMDB's own images. It raises confidence and never rejects a
+# match: a miss usually means the backdrops are promotional stills
+# rather than real frames, which proves nothing either way.
+metadata_verify_frames = 1
+
+# Write a readable .info file beside each finished video containing the
+# identification, the verification result, the source details and every
+# processing decision. Named to match the video so the two pair up in a
+# directory listing.
+metadata_info_file = 1
+
+# Shape:  Title-(Year)-Franchise-AV1_1080p.mkv
+#    TV:  Show-(Year)-S05E01-Episode_Title-AV1_1080p.mkv
+# Underscores instead of spaces, because linux command lines hate spaces.
+name_underscores = 1
+name_episode_title = 1
+name_tech_suffix = 1
+
+# ---------------------------------------------------------------------
+# Subtitle generation
+# ---------------------------------------------------------------------
+# When a language is missing, generate it. English is transcribed from a
+# strongly dialogue-boosted mix of the English audio, which is also kept
+# as its own output track. Japanese is transcribed from the Japanese
+# audio when one exists, and translated from the English subtitles when
+# it does not. Timings come from the file's own audio, so a generated
+# track is always in sync.
+subs_generate = 1
+
+# How long a slice of audio whisper chews at a time, in seconds. 0 uses
+# ffmpeg's own default of 3. Measured on 60 seconds of speech, 20 was
+# both quicker than the default (3.3 s against 5.6 s) and produced
+# tidier, better merged subtitles, so 20 is the setting here.
+whisper_queue = 20
+
+# Voice activity detection. Feeds whisper only the parts that actually
+# contain speech, so it never sees the silence it otherwise fills with
+# invented lines like "thank you for watching". Needs a ggml-silero
+# model file sitting beside the whisper model.
+#
+# OFF by default because it is expensive. Measured on the same 60
+# seconds: 25.4 s with it against 5.6 s without, for a transcript that
+# was otherwise identical. On a two hour film that is the difference
+# between minutes and hours. The trailing-repeat trimmer and the
+# duration clamp already remove invented lines afterwards for free.
+# Turn it on if a particular file keeps producing rubbish over its
+# quiet passages.
+whisper_vad = 0
+
+# Folder holding the whisper ggml model. The installer puts one here.
+whisper_model_dir = C:\ProgramData\whisper
+
+# Blank picks the best model present. ggml-large-v3-turbo.bin is the
+# default and the best quality for the time it takes.
+whisper_model =
+
+# Run whisper on the graphics card. Much faster when supported.
+whisper_gpu = 1
+
+# Translation, used only when there is no Japanese audio to transcribe.
+# Without one of these, English subtitles are still generated; Japanese
+# ones are simply skipped.
+#
+#   argos   FULLY LOCAL. No key, no network, no cost. INSTALLED AND
+#           WORKING on this machine: argostranslate 1.11.0 with the
+#           en->ja model, measured at 0.32 s a line, so about 2.4
+#           minutes for a typical episode.
+#   deepl   paid web service, charges per token. Refused on cost.
+#   openai  any OpenAI-compatible chat endpoint, including a local LLM
+#           server; set translate_endpoint to something like
+#           http://localhost:11434/v1 and put any placeholder in
+#           translate_key.
+#
+# A NOTE ON QUALITY, because it matters more than the plumbing: argos
+# gets roughly half of it right. Measured on plain test sentences,
+# "Where are the keys?" and "It is snowing outside" came back correct,
+# but "Good evening" became the time of day rather than the greeting,
+# and "he would be here by seven" became "here with seven people".
+# On a whisper transcript it is a machine translation of a machine
+# transcription, and the errors compound. Treat the Japanese track as a
+# rough convenience, not a subtitle anyone should rely on.
+#
+# Set this back to deepl to switch it off.
+translate_provider = argos
+translate_key =
+translate_endpoint =
+translate_model =
+
+# ---------------------------------------------------------------------
+# Audio conform  -  OFF, and this is deliberate
+# ---------------------------------------------------------------------
+# This measured where the rendered audio sat against the master and
+# rewrote it to match. It damaged two finished films on 2026-08-11 and
+# is disabled.
+#
+# The flaw is structural, not a tuning problem: a measurement that is
+# wrong ONCE destroys a file that was right. Correlating a heavily
+# processed stereo downmix against a raw surround master is guesswork,
+# and on self-similar film audio it guesses wrong. It read The Simpsons
+# Movie as 206 SECONDS out - from a correlation whose sharpness was 14.4
+# against a floor of 8 - and padded 206 s of silence onto the head, with
+# segments stretched by 8.75 pct. That film had been correct.
+#
+# Sync is preserved by NOT DISTURBING THE TIMELINE: audio is read from
+# the master, decoded, filtered and encoded once, and its timestamps are
+# carried through. Where something upstream does break it, the detection
+# gates fail the file loudly instead of quietly patching it.
+#
+# av1_warp.py still exists as a MANUAL tool, with hard sanity limits, for
+# a file you already know is wrong and are watching while it is fixed.
+# Set this to 1 only if you want it back in the automatic path.
+audio_conform = 0
+audio_conform_step = 60
+
+# Which subtitle languages to keep. Blank keeps all. Subtitle tracks
+# whose size the container does not report are always dropped: copying
+# one of those deadlocks the muxer part way through an encode.
+subs_langs = eng,en,jpn,ja,jp,und
+
+# Shifts every computed quality number. Negative means better quality
+# and larger files; each step is worth roughly 12 percent bitrate, so
+# -2 is about +26 percent and -4 about +59 percent.
+#
+# This is the only quality lever NVENC has left. Preset, tune, lookahead
+# and adaptive quantisation are already at their maximum settings, so
+# there is nothing else to turn up: the remaining choice is bitrate.
+# If you want genuinely better quality per byte rather than more bytes,
+# set encoder = svtav1 instead, which is measurably more efficient than
+# any hardware encoder but takes hours per film rather than minutes.
+cq_offset = 0
+
+# How far the finished picture may differ in length from the source
+# before the file is called failed, in seconds.
+#
+# Measured video track against video track, not container against
+# container: a Matroska container reports the length of its LONGEST
+# track, and a signs or commentary subtitle running past the credits
+# used to fail perfectly good encodes - for a track the pipeline had
+# deliberately dropped.
+#
+# 1 second flat. The old rule scaled with runtime and allowed a 92
+# minute film to drift 27 seconds, which is a whole scene.
+duration_tolerance_sec = 1.0
+
+# Low resolution sources inflate badly when upscaled to 1080 lines,
+# because the bitrate ends up describing the upscale rather than the
+# film. A 512x288 AVI measured 0.69 GB in, 2.66 GB out. These trim the
+# quality number back for that class ONLY; nothing at 720 lines or
+# above is affected.
+#   lowres_trim_h   source height at or below which this applies
+#   lowres_cq_trim  how many steps to add (higher = smaller file)
+#   lowres_cq_ceil  the ceiling for this class alone, deliberately
+#                   above the library-wide one, because the detail up
+#                   there was invented by the scaler, not filmed
+# Measured on a 512x288 source: cq 28 = 418 pct of source, cq 30 = 333
+# pct, cq 33 = 240 pct, cq 36 = 173 pct, cq 39 = 126 pct.
+# Set lowres_cq_trim = 0 to switch the whole thing off.
+lowres_trim_h = 576
+lowres_cq_trim = 8
+lowres_cq_ceil = 36
+
+# Sources with at least this many lines of real picture keep the quality
+# number their tier earned, even when they are upscaled to 1080.
+#
+# upscale_cq exists because detail invented by a scaler is not worth
+# spending bits on, which is true of a 512x288 AVI. It is NOT true of a
+# 1920x800 scope feature - that is a full Blu-ray rip which simply has
+# fewer than 1080 lines because of its aspect ratio. The Simpsons Movie
+# arrived at tier HIGH, 9.86 Mbps, 0.268 bits per pixel, and went out at
+# 0.04 bpp purely because 800 is less than 1080. It blocked visibly.
+#
+# Set to 0 to go back to treating every upscale the same.
+upscale_cq_max_h = 720
+
+# ---------------------------------------------------------------------
+# Target resolution
+# ---------------------------------------------------------------------
+# How many lines of ACTUAL PICTURE to aim for. Bars are never counted,
+# so a letterboxed film is measured on the picture inside them.
+#   1080   the standard, and the default
+#   2160   4K, opt-in
+# 2160 only produces a 4K master when the source is ALREADY close to 4K.
+# A DVD or a 1080p Blu-ray in a 4K batch is still finished at 1080p: the
+# AI upscaler never aims above 1080 lines, because inventing 4K detail
+# from a smaller source bakes artifacts in permanently.
+#
+# The GUI dropdown starts from this value every time the window opens
+# and a change there applies to that run only, exactly like no_sr and
+# sdr_to_hdr. This is library-wide policy, not a per-run preference.
+target_res = 1080
+
+# What counts as "close to 4K", and so eligible for a 4K master.
+# Measured on the stored WIDTH rather than the height, because width
+# survives letterboxing: a 2.39:1 UHD is 3840x1608 once the bars come
+# off, which a height test would wrongly reject. uhd_min_pixels is the
+# second guard so a 3840x1080 ultrawide cannot qualify on width alone.
+uhd_min_width = 3000
+uhd_min_pixels = 5500000
+
+# Real picture within this percentage of 2160 lines is brought UP to
+# 2160 exactly; anything further below keeps its native size. A 1.85:1
+# UHD has 2076 real lines, which is 96.1 pct, so it pads. A 2.39:1 scope
+# title has 1608 lines, which is 74.4 pct, so it stays as it is rather
+# than being stretched to a line count it was never shot at.
+uhd_pad_band_pct = 10
+
+# Size ceiling for a 4K master, in GB. SOFT on purpose. The target is
+# the smaller of the source's own size and this number, so a 6 GB web-dl
+# aims at 6 GB rather than being inflated to fill the allowance.
+#
+# If holding the quality floor below still predicts an oversized file,
+# THE FILE WINS and the log says so loudly. Picture quality outranks
+# size. For scale: 10 GB on a 100 minute film is about 0.055 bits per
+# pixel, against the 0.194 the 1080p standard spends - roughly a third.
+uhd_max_gb = 10.0
+
+# The quality floor, expressed as the worst CQ the size budget may drive
+# to. CQ rises to fit the budget and stops here.
+#
+# 32 is what lets the 10 GB cap actually work on a real remux: on a 101
+# minute UHD it predicts about 9.6 GB all in. A floor of 30 stops around
+# 12.4 GB, which makes the cap close to decorative. Raise this to protect
+# picture harder and accept bigger files; lower it to hold the size down
+# at the cost of picture.
+uhd_cq_ceil = 32
+
+# Bits per second left for audio, subtitles and container overhead when
+# working out how many bits the video may have. Four Opus tracks on a
+# surround source run to about 2 Mbps.
+uhd_overhead_mbps = 2.5
+
+# Calibration constant for predicting output size from CQ without a test
+# encode, in bits per pixel per second at CQ 27.
+#
+# MEASURED on this machine over five 20 second windows spread across a
+# UHD remux at 3996x2160: 23.62, 25.54, 24.71, 22.34, 23.48 Mbps, mean
+# 23.94, spread about 7 pct. That is ONE title, and 1988 film stock with
+# real grain is expensive to encode, so a clean modern digital source
+# will land under this figure and a busier one over it.
+#
+# Note also that the CQ curve is NOT a clean exponential: measured on the
+# same file, CQ 21 = 50.20 Mbps, 23 = 30.27, 25 = 30.08, 27 = 24.71,
+# 29 = 18.27, 31 = 13.34. There is a real plateau at 23-25. So this
+# predicts a sensible starting CQ rather than promising a final size.
+#
+# Set to 0 to switch size prediction off, in which case CQ comes from the
+# tier table alone and only the VBV cap constrains the result.
+uhd_bpp_ref = 0.1157
+
+# Artifact repair for damaged 4K sources.
+#   auto    repair when the source lands in artifact_repair_tiers.
+#           Default.
+#   off     never
+#   weak    always, gentle
+#   strong  always, aggressive
+# The filter is ffmpeg's deblock. It is the ONLY candidate that is both
+# 10-bit clean and fast enough at 4K: fspp, pp7 and uspp are all 8-bit
+# only and would drag the entire filter graph down to 8 bits, and spp
+# costs between 12 and 110 hours a film. All measured, not assumed.
+#
+# Gated on the existing bits-per-pixel tier table rather than on a
+# blockiness detector. ffmpeg's blockdetect was measured for this job and
+# is unusable: on a fair bitrate ladder it scored a transparent 8000k
+# encode at 1.6222, a 600k one at 1.3681 and a wrecked 300k one at
+# 1.5613. Non-monotonic, so no threshold separates good from bad.
+#
+# Costs roughly 40 minutes on a 110 minute film at 4K.
+artifact_repair = auto
+artifact_repair_tiers = low,awful
+
+# When deband runs.
+#   auto    only on sources under 10-bit, where 8-bit quantisation
+#           banding actually exists to be fixed. Default.
+#   always  on everything. Costs real CPU at 4K, and on a clean 10-bit
+#           master it adds dither rather than removing steps.
+#   off     never.
+# This is a quality choice, not a speed one. If you see banding in dark
+# gradients on a 4K encode, set this to always and compare.
+deband_mode = auto
+
+# Who assembles the finished file. With this on, ffmpeg produces only
+# the video and audio and mkvmerge adds the subtitles, fonts and
+# chapters afterwards. mkvmerge is purpose-built for Matroska, and
+# three of the nastiest faults this pipeline has had all lived in
+# ffmpeg's Matroska writer: a subtitle deadlock that froze 4K remuxes,
+# an attachment bug that made healthy encodes look hung, and a subtitle
+# running past the end of the picture. Set to 0 to go back to the
+# single ffmpeg command. Ignored if mkvmerge is not installed.
+mux_mkvmerge = 1
+
+# Hardware video decode. auto tests it at startup and uses it if the
+# card supports it, which is the single biggest speed gain on 4K:
+# decoding 4K HEVC in software pins the CPU and leaves the GPU encoder
+# waiting for frames. cuda forces it, none disables it.
+hwaccel = auto
+
+# Fixed audio layout. Every kept track is re-encoded to Opus in this
+# exact order, and everything else is dropped, including commentary and
+# audio-description tracks:
+#   1 English stereo downmix      2 Japanese stereo downmix
+#   3 English original surround   4 Japanese original surround
+audio_fixed_layout = 1
+
+# Opus quality for the original surround tracks, kbps per channel.
+# 128 is well past transparent; 80 is already hard to tell from source.
+audio_opus_per_ch = 128
+
+# Which audio languages to keep. A Blu-ray remux ships every dub, and
+# carrying fifteen of them means fifteen concurrent encoders and
+# gigabytes of audio nobody plays. Blank keeps every language.
+audio_langs = eng,en,jpn,ja,jp
+
+# For English, keep only the generated stereo downmix rather than the
+# surround masters. Any English 2 channel track already in the source is
+# kept as well. Set to 0 to keep the English surround tracks too.
+audio_eng_stereo_only = 1
+
+# List the stereo downmix first, so players open on it.
+audio_mix_first = 1
+
+# Seconds with no forward progress before an encode is treated as hung
+# and killed. ffmpeg can keep reporting a slowly falling speed while the
+# output position never moves, which looks like a slow encode but is
+# actually a stall. 0 disables the watchdog.
+stall_timeout_sec = 420
+
+# Keep every audio track, ordered with English first. 0 keeps only the
+# single best track, which is how older versions behaved.
+audio_keep_all = 1
+
+# Add a stereo downmix of any English surround track, with the centre
+# channel lifted for dialogue. Useful on headphones and TV speakers.
+# The surround track stays the default; this one is there to be chosen.
+audio_add_stereo_mix = 1
+
+# Centre channel lift in that downmix. 1.0 is the normal downmix, which
+# already lifts centre 30 percent. 1.25 lifts it further again.
+audio_mix_centre = 1.25
+
+# Dialogue enhancement strength on the downmix, 0 to 3. ffmpeg's
+# dialoguenhance filter. 0 turns it off.
+audio_mix_enhance = 0.6
+
+# Add a blank subtitle track first so players open with subtitles off
+# instead of showing whichever track happened to be first in the source.
+subs_blank_first = 1
+
+# What happens to the audio track.
+#
+#   auto    keep the original stream untouched when it is already a
+#           codec every player handles (AC3, E-AC3, AAC, DTS, TrueHD,
+#           FLAC, MP3, Opus, PCM), and convert anything more awkward to
+#           Opus. This is the default and it loses nothing on a normal
+#           DVD or Blu-ray rip.
+#   copy    never re-encode. Truest to the source. A very old or unusual
+#           codec may then need transcoding at playback time.
+#   opus    always convert to Opus. Best quality for the size of any
+#           current lossy codec, and handles surround properly.
+#   aac     always convert to AAC. Only worth it for a player that
+#           refuses Opus.
+#
+# Re-encoding audio that is already lossy loses a little every time, so
+# copying is the honest answer whenever the source codec is fine.
+audio_mode = opus
+
+# Set to 1 to fold surround down to stereo. Off by default, so a 5.1
+# track stays 5.1. Turning this on forces a re-encode, because filters
+# cannot be applied to a copied stream.
+audio_downmix = 0
+
+# Set to 1 to run a noise reducer over badly starved audio. Off by
+# default. It only engages below about 64 kbps a channel, so a normal
+# AC3 5.1 track at 448k is never touched. Leave it off unless you are
+# working with genuinely poor sources; it smears detail on anything else.
+audio_denoise = 0
+
+# ---------------------------------------------------------------------
+# The 1080p standard
+# ---------------------------------------------------------------------
+# The target is 1080 lines of ACTUAL PICTURE, measured after black bars
+# are cropped away. Width follows whatever aspect the film is in, so a
+# 2.39:1 scope film lands at 2580x1080 and a 16:9 one at 1920x1080.
+# Nothing is ever stored as black bars.
+#
+# Black bars are found by sampling across the whole file and taking the
+# shape the film spends most of its time in. Top, bottom, side, and
+# postage-stamp bars are all handled. If a film genuinely changes aspect
+# part way through, the dominant ratio wins and the log says so.
+#
+# What happens to a file then follows from the cropped picture height:
+#   under 1080 lines   upscaled, and eligible for the AI upscaler
+#   exactly 1080       left alone, with a contrast adaptive sharpen
+#   over 1080          downscaled, which oversamples and is already sharp
+# A 1080p file with bars has less than 1080 lines of real picture, so it
+# gets upscaled like any other short source.
+
+# Contrast Adaptive Sharpen strength, 0 to 1. Only used where no rescale
+# happens, since a resize brings its own sharpness change. This is the
+# FidelityFX CAS algorithm, but ffmpeg runs it on the CPU, so it works
+# the same on any graphics card. 0 turns it off.
+cas_strength = 0.30
+
+# Saturation lift for standard definition sources, 1.0 is unchanged.
+# This is a deliberate look change rather than a restoration, so keep it
+# modest. Only applied to sources at or below 720 lines.
+sd_saturation = 1.06
+
+# How much of the AI upscale to keep, 0 to 100.
+#
+# Real-ESRGAN looks at one frame at a time and has no memory of the
+# frame before it, so it invents slightly different detail every frame.
+# On a still background that reads as crawling or shimmering. Tools like
+# Topaz avoid it by feeding the model several frames at once, which is a
+# property of the model and cannot be added here.
+#
+# What this does instead is blend the model output back towards a plain
+# lanczos upscale. 100 is the raw model with all its shimmer, 0 is no AI
+# at all, 50 keeps half the invented detail and roughly halves the
+# flicker with it. Lower this further if backgrounds still crawl.
+sr_strength = 50
+
+# Temporal stabiliser applied after the blend. Averages each pixel
+# across neighbouring frames only while the difference stays small, so
+# still backgrounds settle while anything actually moving passes through
+# untouched. Set to 0 to turn it off.
+sr_stabilise = 1
+
+# Fast local folder for the upscaler's frame files. Leave blank to use
+# the destination.
+#
+# WHERE EVERY INTERMEDIATE FILE GOES. This must be a LOCAL disk.
+#
+# It is no longer only the upscaler's frames. As of 0.24 this governs
+# all working material:
+#   - upscaler PNG frames, and the per-chunk encoded pieces
+#   - the elementary streams pulled out for a Dolby Vision strip, which
+#     are the size of the film TWICE OVER, plus the remux as a third
+#     copy - about 145 GB of traffic for a single 50 GB title
+#   - extracted ASR audio for whisper
+#   - the video+audio intermediate that mkvmerge reads back
+#   - frames sampled for the visual check, tag XML, the blank subtitle
+#
+# ONLY THE FINISHED OUTPUT IS WRITTEN TO THE DESTINATION. Working files
+# are large, short-lived, and read back immediately, so which disk they
+# land on is the biggest throughput decision the pipeline makes.
+#
+# Size it for the largest title: a Dolby Vision strip needs roughly 3.2
+# times the source size, and the pipeline refuses the file with a clear
+# message rather than filling the disk half way through.
+#
+# LEAVE THIS BLANK TO HAVE IT CHOSEN AUTOMATICALLY, which is the right
+# setting on a machine other than the one this was built on. The
+# pipeline ranks every fixed local disk by what Windows says it is -
+# NVMe, then SSD, then spinning - drops any without room for the largest
+# file in the queue, and demotes the disk holding the destination so
+# working files and finished output do not share a spindle. It then
+# opens its own session directory there and removes it when the run
+# ends, however it ends. Setting a path here overrides all of that.
+#
+# On the machine this was developed on the automatic choice picks S:,
+# which is the same disk that used to be set by hand below.
+# Example: sr_tmp_dir = C:\av1_scratch
+sr_tmp_dir =
+
+# Choose the scratch disk automatically when sr_tmp_dir is blank.
+# Setting this to 0 with a blank sr_tmp_dir sends working files to the
+# destination's .tmp folder, which is the old behaviour and is slower.
+scratch_auto = 1
+
+# A disk needs at least this much free space, in GB, to be considered
+# for scratch at all. The real requirement is worked out per run from
+# the largest file in the queue; this is the floor beneath that.
+scratch_min_free_gb = 50
+
+# Upscale factor for the AI model.
+#   0  pick the smallest the model has that clears 1080 lines
+#   2  force x2
+# The cost is quadratic. A 528 line film at x4 becomes 2112 lines and
+# then most of those pixels are thrown away scaling back down to 1080;
+# x2 lands at 1056 and the last 2 percent is a near-free resize. Four
+# times fewer pixels to compute.
+#
+# NOTE: only realesr-animevideov3 has x2 and x3. realesrgan-x4plus is a
+# 4x model and nothing else, so forcing x2 with it will warn and use x4.
+sr_scale = 2
+
+# Tile size handed to the upscaler, in pixels.
+#   0  work it out from the video memory actually free at the time
+#   N  force that tile
+#
+# Leave this at 0. Memory cost goes as tile SQUARED and again as scale
+# SQUARED, so a fixed number that is fine at x2 can be several times
+# over the card at x4. A 1024 tile at x4 is about 11 GB on its own.
+sr_tile = 0
+
+# How much of the card a run may aim at in total, in MB, and how much
+# to hold back.
+#
+# The upscaler does NOT have the card to itself: the encode of the
+# previous file runs alongside it and was measured at 2.3 to 3.4 GB,
+# and the desktop wants some too. The reserve is what keeps that from
+# becoming a crash. The tile is then sized from whatever is genuinely
+# free at the moment the upscale starts, less the reserve, so a busy
+# card simply gets a smaller tile instead of falling over.
+#
+# If it still runs out, the pipeline halves the tile and retries rather
+# than failing the file, and the log says where it settled.
+sr_vram_mb = 15000
+# Held back for the NVENC session that encodes each upscaled chunk while
+# the model is still resident. Measured at 2.3 to 3.4 GB, so 3400.
+sr_vram_reserve_mb = 3400
+
+# ---------------------------------------------------------------------
+# GPU safety
+# ---------------------------------------------------------------------
+# HARD ceiling on TOTAL video memory in use, as a percentage of the card.
+# This is the line that must never be crossed. Crossing it does not fail
+# a file politely - it resets the display driver, and on 2026-08-06 it
+# took the whole machine down: six nvlddmkm errors at 18:21, then an
+# unexpected shutdown.
+#
+# 98 leaves the desktop compositor and anything else running room. Set
+# lower if you use the machine while it works. 100 is refused.
+gpu_max_pct = 98
+
+# Largest tile the upscaler may be given, whatever the arithmetic says.
+# 896 at x4 was MEASURED safe alongside a running encode, at about
+# 8.3 GB. The budget picked 992 on 2026-08-06 and the driver fell over
+# 31 minutes later. The underlying cost model comes from ncnn's own
+# auto-select thresholds, which are heuristics rather than measured
+# allocations, so it is not trusted past what has actually been tried.
+sr_tile_max = 896
+
+# Seconds to let the driver hand video memory back after a process is
+# killed. nvidia-smi keeps reporting the old figure for a moment, and
+# sizing the next job against that stale number turns one over-commit
+# into two.
+gpu_settle_sec = 5
+
+# How long to wait for video memory before giving up on a file and
+# moving on to the next. Never blocks forever; never barges in either.
+gpu_wait_sec = 300
+
+# ---------------------------------------------------------------------
+# Load ceilings, after three hard machine freezes
+# ---------------------------------------------------------------------
+# On 2026-08-06, and twice on 2026-08-09, the whole machine locked up.
+# Every one of them recorded Kernel-Power 41 with BugcheckCode=0,
+# PowerButtonTimestamp=0, no crash dump and no WHEA hardware error.
+# That combination means Windows did NOT crash - there was no blue
+# screen and nobody held the power button. The kernel simply stopped
+# running, which is what heat, power delivery or memory instability do.
+# Software cannot fix that. What it CAN do is stop standing on the
+# limit, which is what everything below is for.
+#
+# Temperature the card must come back under before more work is added.
+# 0 disables the check.
+gpu_temp_max_c = 80
+gpu_cool_sec = 15
+
+# Seconds to idle between upscaler chunks. Without this the upscale
+# holds the GPU, the CPU and the disk at full tilt for eleven hours
+# without a break. Costs a few percent of throughput.
+sr_chunk_pause_sec = 2.0
+
+# Threads for load : process : save. The tool's own default is 1:2:2,
+# and with thousands of small PNG frames one decode thread leaves the
+# card waiting on the disk instead of computing.
+sr_threads = 4:4:4
+
+# Set to 1 to skip Real-ESRGAN entirely and upscale with lanczos.
+# Much faster, noticeably softer. Leave at 0 for normal runs.
+no_sr = 0
+
+# Set to 1 to expand SDR sources into HDR10 color. Off by default
+# because it changes the look of every SDR file in the batch.
+sdr_to_hdr = 0
+

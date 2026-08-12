@@ -1,0 +1,314 @@
+# =====================================================================
+# AV1 Pipeline config
+# =====================================================================
+# One setting per line, written as   key = value
+# Anything after a # is a comment. Blank lines are ignored.
+# Paths are typed plainly. No quotes, no doubled backslashes.
+#
+# Edit this file with Notepad, save, and the change takes effect on the
+# next run. Both the pipeline and the GUI read this same file.
+#
+# A command line flag always beats what is written here.
+# =====================================================================
+
+# Where the source files are read from.
+src = P:\2_Storage\Film and TV\DownConvert\Input
+
+# Where the finished files are written.
+dst = P:\2_Storage\Film and TV\DownConvert\Output
+
+# Which encoder does the work.
+#   auto    test the GPU at startup, fall back to the CPU if it cannot
+#           encode AV1. This is the right setting for almost everyone.
+#   nvenc   force the GPU. The run stops if it will not encode AV1.
+#   svtav1  force the CPU encoder and skip the GPU test.
+# Only Ada (RTX 40) and newer NVIDIA cards can encode AV1 at all. On a
+# card that can, the GPU encoder still needs an ffmpeg build and a driver
+# that agree on the NVENC API version. When they do not, auto keeps the
+# batch moving on the CPU and switches back to the GPU on its own as
+# soon as the mismatch is resolved.
+encoder = auto
+
+# CPU encoder speed, 0 slowest and best through 13 fastest and worst.
+# 4 to 8 is the useful range. 6 is a good starting point. Every step
+# up roughly halves the encode time and costs a little quality.
+# Ignored when the GPU encoder is in use.
+svtav1_preset = 6
+
+# Folder holding a specific ffmpeg.exe and ffprobe.exe to use instead
+# of whichever one is on PATH. Leave blank for normal use.
+#
+# This is the lever for the NVENC API mismatch. ffmpeg builds sometimes
+# ship compiled against an NVENC SDK newer than any released driver
+# supports, and the GPU encoder then refuses to start even though the
+# card is perfectly capable. Unpack an older ffmpeg build somewhere and
+# point this at its bin folder to get the GPU back.
+# Example: ffmpeg_dir = C:\ffmpeg-7.1-full_build\bin
+ffmpeg_dir =
+
+# Where pipeline.log and av1_trace.log are written.
+# Leave this blank for the default, which is a logs folder inside the
+# output folder above. Put a path here to send them somewhere else.
+log_dir =
+
+# The run stops early if free space on the destination drive falls
+# below this many GB. Raise it if the drive fills up mid batch.
+min_free_gb = 20
+
+# Real-ESRGAN model used when a sub-1080 file gets upscaled.
+#   realesr-animevideov3    fast, best on animation and cartoons
+#   realesrgan-x4plus       slower, general purpose, live action
+#   realesrgan-x4plus-anime slower, tuned for anime line art
+sr_model = realesr-animevideov3
+
+# Extra data rate for genuinely high quality sources, as a percentage.
+# A 4K 10-bit master carries far more real detail than a broadcast rip,
+# and squeezing it to the same quality number is what leaves visible
+# artifacts in the downscale. Only applies to sources at 2000 lines or
+# more that are also 10-bit. 0 turns it off.
+hq_source_boost_pct = 30
+
+# ---------------------------------------------------------------------
+# Metadata, naming, and tagging
+# ---------------------------------------------------------------------
+# Look the film up, write its details into the file, and rename it.
+# The folder structure is never changed; only the file is renamed, so a
+# file that escapes its folder still identifies itself.
+metadata_enable = 1
+
+# Free API key from https://www.themoviedb.org/settings/api
+# Without one, lookups are skipped and files keep their original names.
+tmdb_api_key =
+
+# Rename finished files from the metadata. 0 tags only.
+rename_files = 1
+
+# Shape:  Title-(Year)-Franchise-AV1_1080p.mkv
+#    TV:  Show-(Year)-S05E01-Episode_Title-AV1_1080p.mkv
+# Underscores instead of spaces, because linux command lines hate spaces.
+name_underscores = 1
+name_episode_title = 1
+name_tech_suffix = 1
+
+# ---------------------------------------------------------------------
+# Subtitle generation
+# ---------------------------------------------------------------------
+# When a language is missing, generate it. English is transcribed from a
+# strongly dialogue-boosted mix of the English audio, which is also kept
+# as its own output track. Japanese is transcribed from the Japanese
+# audio when one exists, and translated from the English subtitles when
+# it does not. Timings come from the file's own audio, so a generated
+# track is always in sync.
+subs_generate = 1
+
+# Folder holding the whisper ggml model. The installer puts one here.
+whisper_model_dir = C:\ProgramData\whisper
+
+# Blank picks the best model present. ggml-large-v3-turbo.bin is the
+# default and the best quality for the time it takes.
+whisper_model =
+
+# Run whisper on the graphics card. Much faster when supported.
+whisper_gpu = 1
+
+# Translation, used only when there is no Japanese audio to transcribe.
+#   deepl   a DeepL API key, free tier is 500k characters a month
+#   openai  any OpenAI-compatible chat endpoint, including local ones
+# Without a key, English subtitles are still generated; Japanese ones
+# are simply skipped.
+translate_provider = deepl
+translate_key =
+translate_endpoint =
+translate_model =
+
+# How often the audio sync check reports while it walks the file, in
+# windows. Lower means more frequent. 0 turns the running report off.
+sync_report_every = 12
+
+# Offset in milliseconds that earns a warning during that check.
+sync_warn_ms = 120
+
+# Which subtitle languages to keep. Blank keeps all. Subtitle tracks
+# whose size the container does not report are always dropped: copying
+# one of those deadlocks the muxer part way through an encode.
+subs_langs = eng,en,jpn,ja,jp,und
+
+# Shifts every computed quality number. Negative means better quality
+# and larger files; each step is worth roughly 12 percent bitrate, so
+# -2 is about +26 percent and -4 about +59 percent.
+#
+# This is the only quality lever NVENC has left. Preset, tune, lookahead
+# and adaptive quantisation are already at their maximum settings, so
+# there is nothing else to turn up: the remaining choice is bitrate.
+# If you want genuinely better quality per byte rather than more bytes,
+# set encoder = svtav1 instead, which is measurably more efficient than
+# any hardware encoder but takes hours per film rather than minutes.
+cq_offset = 0
+
+# When deband runs.
+#   auto    only on sources under 10-bit, where 8-bit quantisation
+#           banding actually exists to be fixed. Default.
+#   always  on everything. Costs real CPU at 4K, and on a clean 10-bit
+#           master it adds dither rather than removing steps.
+#   off     never.
+# This is a quality choice, not a speed one. If you see banding in dark
+# gradients on a 4K encode, set this to always and compare.
+deband_mode = auto
+
+# Hardware video decode. auto tests it at startup and uses it if the
+# card supports it, which is the single biggest speed gain on 4K:
+# decoding 4K HEVC in software pins the CPU and leaves the GPU encoder
+# waiting for frames. cuda forces it, none disables it.
+hwaccel = auto
+
+# Fixed audio layout. Every kept track is re-encoded to Opus in this
+# exact order, and everything else is dropped, including commentary and
+# audio-description tracks:
+#   1 English stereo downmix      2 Japanese stereo downmix
+#   3 English original surround   4 Japanese original surround
+audio_fixed_layout = 1
+
+# Opus quality for the original surround tracks, kbps per channel.
+# 128 is well past transparent; 80 is already hard to tell from source.
+audio_opus_per_ch = 128
+
+# Which audio languages to keep. A Blu-ray remux ships every dub, and
+# carrying fifteen of them means fifteen concurrent encoders and
+# gigabytes of audio nobody plays. Blank keeps every language.
+audio_langs = eng,en,jpn,ja,jp
+
+# For English, keep only the generated stereo downmix rather than the
+# surround masters. Any English 2 channel track already in the source is
+# kept as well. Set to 0 to keep the English surround tracks too.
+audio_eng_stereo_only = 1
+
+# List the stereo downmix first, so players open on it.
+audio_mix_first = 1
+
+# Seconds with no forward progress before an encode is treated as hung
+# and killed. ffmpeg can keep reporting a slowly falling speed while the
+# output position never moves, which looks like a slow encode but is
+# actually a stall. 0 disables the watchdog.
+stall_timeout_sec = 420
+
+# Keep every audio track, ordered with English first. 0 keeps only the
+# single best track, which is how older versions behaved.
+audio_keep_all = 1
+
+# Add a stereo downmix of any English surround track, with the centre
+# channel lifted for dialogue. Useful on headphones and TV speakers.
+# The surround track stays the default; this one is there to be chosen.
+audio_add_stereo_mix = 1
+
+# Centre channel lift in that downmix. 1.0 is the normal downmix, which
+# already lifts centre 30 percent. 1.25 lifts it further again.
+audio_mix_centre = 1.25
+
+# Dialogue enhancement strength on the downmix, 0 to 3. ffmpeg's
+# dialoguenhance filter. 0 turns it off.
+audio_mix_enhance = 0.6
+
+# Add a blank subtitle track first so players open with subtitles off
+# instead of showing whichever track happened to be first in the source.
+subs_blank_first = 1
+
+# What happens to the audio track.
+#
+#   auto    keep the original stream untouched when it is already a
+#           codec every player handles (AC3, E-AC3, AAC, DTS, TrueHD,
+#           FLAC, MP3, Opus, PCM), and convert anything more awkward to
+#           Opus. This is the default and it loses nothing on a normal
+#           DVD or Blu-ray rip.
+#   copy    never re-encode. Truest to the source. A very old or unusual
+#           codec may then need transcoding at playback time.
+#   opus    always convert to Opus. Best quality for the size of any
+#           current lossy codec, and handles surround properly.
+#   aac     always convert to AAC. Only worth it for a player that
+#           refuses Opus.
+#
+# Re-encoding audio that is already lossy loses a little every time, so
+# copying is the honest answer whenever the source codec is fine.
+audio_mode = auto
+
+# Set to 1 to fold surround down to stereo. Off by default, so a 5.1
+# track stays 5.1. Turning this on forces a re-encode, because filters
+# cannot be applied to a copied stream.
+audio_downmix = 0
+
+# Set to 1 to run a noise reducer over badly starved audio. Off by
+# default. It only engages below about 64 kbps a channel, so a normal
+# AC3 5.1 track at 448k is never touched. Leave it off unless you are
+# working with genuinely poor sources; it smears detail on anything else.
+audio_denoise = 0
+
+# ---------------------------------------------------------------------
+# The 1080p standard
+# ---------------------------------------------------------------------
+# The target is 1080 lines of ACTUAL PICTURE, measured after black bars
+# are cropped away. Width follows whatever aspect the film is in, so a
+# 2.39:1 scope film lands at 2580x1080 and a 16:9 one at 1920x1080.
+# Nothing is ever stored as black bars.
+#
+# Black bars are found by sampling across the whole file and taking the
+# shape the film spends most of its time in. Top, bottom, side, and
+# postage-stamp bars are all handled. If a film genuinely changes aspect
+# part way through, the dominant ratio wins and the log says so.
+#
+# What happens to a file then follows from the cropped picture height:
+#   under 1080 lines   upscaled, and eligible for the AI upscaler
+#   exactly 1080       left alone, with a contrast adaptive sharpen
+#   over 1080          downscaled, which oversamples and is already sharp
+# A 1080p file with bars has less than 1080 lines of real picture, so it
+# gets upscaled like any other short source.
+
+# Contrast Adaptive Sharpen strength, 0 to 1. Only used where no rescale
+# happens, since a resize brings its own sharpness change. This is the
+# FidelityFX CAS algorithm, but ffmpeg runs it on the CPU, so it works
+# the same on any graphics card. 0 turns it off.
+cas_strength = 0.30
+
+# Saturation lift for standard definition sources, 1.0 is unchanged.
+# This is a deliberate look change rather than a restoration, so keep it
+# modest. Only applied to sources at or below 720 lines.
+sd_saturation = 1.06
+
+# How much of the AI upscale to keep, 0 to 100.
+#
+# Real-ESRGAN looks at one frame at a time and has no memory of the
+# frame before it, so it invents slightly different detail every frame.
+# On a still background that reads as crawling or shimmering. Tools like
+# Topaz avoid it by feeding the model several frames at once, which is a
+# property of the model and cannot be added here.
+#
+# What this does instead is blend the model output back towards a plain
+# lanczos upscale. 100 is the raw model with all its shimmer, 0 is no AI
+# at all, 50 keeps half the invented detail and roughly halves the
+# flicker with it. Lower this further if backgrounds still crawl.
+sr_strength = 50
+
+# Temporal stabiliser applied after the blend. Averages each pixel
+# across neighbouring frames only while the difference stays small, so
+# still backgrounds settle while anything actually moving passes through
+# untouched. Set to 0 to turn it off.
+sr_stabilise = 1
+
+# Fast local folder for the upscaler's frame files. Leave blank to use
+# the destination.
+#
+# The upscaler cannot stream. It only reads and writes image files on
+# disk, so every frame becomes a PNG and comes back as a bigger PNG,
+# thousands per chunk. If the destination is a network share that write
+# traffic is the slowest part of the whole job by a wide margin. Point
+# this at a local SSD folder and the same work finishes far quicker.
+# Only about 1 to 2 GB is used at a time; the encoded pieces still go to
+# the destination.
+# Example: sr_tmp_dir = C:\av1_scratch
+sr_tmp_dir =
+
+# Set to 1 to skip Real-ESRGAN entirely and upscale with lanczos.
+# Much faster, noticeably softer. Leave at 0 for normal runs.
+no_sr = 0
+
+# Set to 1 to expand SDR sources into HDR10 color. Off by default
+# because it changes the look of every SDR file in the batch.
+sdr_to_hdr = 0

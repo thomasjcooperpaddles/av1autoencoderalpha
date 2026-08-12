@@ -1,0 +1,742 @@
+=====================================================================
+AV1 PIPELINE  V0.22
+How to install, run, and configure
+Updated 2026-07-30
+=====================================================================
+
+
+WHAT YOU DOWNLOADED
+=====================================================================
+
+Install AV1 Pipeline.cmd     Double-click this to install.
+install_av1_pipeline.ps1     The installer itself. The .cmd calls it.
+                             Both programs are packed inside this file.
+
+AV1_Pipeline_instructions.txt   This file.
+
+av1_pipeline_v0_1.py         Reference copies. You do not need these.
+av1_pipeline_gui_v0_1.py     The installer already carries both.
+av1_pipeline_config.txt      Reference copy of the settings file.
+
+The only two files that matter are the .cmd and the .ps1, and they
+have to sit in the same folder as each other. Any folder is fine.
+Downloads is fine. The installer finds itself from wherever it is.
+
+
+INSTALL
+=====================================================================
+
+1. Make sure drive P: is connected and you can open
+   P:\2_Storage\Film and TV\DownConvert in Explorer.
+
+2. Put "Install AV1 Pipeline.cmd" and "install_av1_pipeline.ps1" in
+   the same folder.
+
+3. Double-click "Install AV1 Pipeline.cmd".
+   Do NOT right-click and choose "Run as administrator". If P: is a
+   mapped network drive, an administrator window cannot see it and the
+   install will stop with a message saying so.
+
+The window stays open when it finishes so you can read the results.
+Near the bottom you get a verify block listing ffmpeg, Python,
+mkvmerge, dovi_tool, realesrgan, numpy, scipy, and the selftest.
+Anything printed as NOT found needs attention before real work.
+The selftest should end with SELFTEST PASS.
+
+Every install is a full clean replace, not a patch over the old files.
+The installer stops anything running, wipes the whole Software folder
+(both programs, the settings file, gui_settings.json, the launcher, and
+any __pycache__), then extracts fresh copies. That is deliberate: a
+leftover file from an older version is how a fixed bug comes back.
+
+Your old settings file is copied to
+av1_pipeline_config.backup-<date>-<time>.txt in the same folder before
+the wipe, so nothing you typed is lost. Compare it against the new one
+if you had changed anything.
+
+Input and Output are never touched. Your finished files, journal, and
+logs are all safe.
+
+Dependencies are checked and skipped when already present, so a repeat
+install is quick.
+
+installed_version.txt in the Software folder records which version is
+in place and when it landed.
+
+
+RUN
+=====================================================================
+
+Double-click the "AV1 Pipeline" shortcut on your desktop.
+
+There is a second copy of the launcher here, if the shortcut ever
+goes missing:
+    P:\2_Storage\Film and TV\DownConvert\Software\AV1 Pipeline.cmd
+
+The window opens with the folders already filled in. Press Start.
+
+Before a real batch, press "Selftest" once. Then tick "Analyze only"
+and press Start. That reads every file in the Input folder, works out
+what it would do to each one, writes a report, and encodes nothing.
+Read the report, then untick "Analyze only" and run for real.
+
+Stop ends the current file. Nothing is lost. The journal remembers
+what finished, so pressing Start again picks up where it stopped.
+
+
+THE 1080p STANDARD
+=====================================================================
+
+The target is 1080 lines of ACTUAL PICTURE, measured after black bars
+are cropped away. Width follows whatever aspect the film is in:
+
+    2.39:1 scope        2580 x 1080
+    1.90:1 IMAX         2046 x 1080
+    1.85:1              1998 x 1080
+    16:9                1920 x 1080
+
+Black bars are never stored. A scope film is therefore a larger file
+than a 16:9 one at the same quality setting, because it holds more
+actual picture.
+
+Bars are found by sampling across the whole file and taking the shape
+the film spends most of its time in. Top, bottom, side, and
+postage-stamp bars are all handled. One sample missing the bars, which
+happens on a fade to black, no longer throws the result away. If a film
+genuinely changes aspect part way through, the dominant ratio wins and
+the log says so.
+
+What happens next follows from the cropped picture height:
+
+    under 1080 lines    upscaled, and eligible for the AI upscaler
+    exactly 1080        left alone, with a contrast adaptive sharpen
+    over 1080           downscaled
+
+A 1080p file with bars has less than 1080 lines of real picture, so it
+gets upscaled like any other short source. A 2.39:1 1080p file is only
+804 real lines.
+
+Colour: every output is 10-bit. Deband runs as standard, which is the
+real gain 10-bit brings. It cannot add colour a source never captured,
+but it can smooth the banding an 8-bit source already has and then
+carry that smoothed gradient through encoding instead of re-quantising
+it straight back into bands. SDR sources stay BT.709 rather than being
+expanded into HDR, which players would only tone-map back down again.
+Standard definition sources get a modest saturation lift on top.
+
+
+AUDIO AND SUBTITLE LAYOUT
+=====================================================================
+
+SDH means Subtitles for the Deaf and Hard of hearing: the usual
+dialogue plus speaker names and sound effects such as [door creaks].
+Forced subtitles caption only the parts meant to be translated for
+everyone, such as a scene in another language.
+
+When the audio is not in English, an English subtitle track is flagged
+default instead of the blank Off track, so a foreign language film
+opens with subtitles showing. A generated English track takes that slot
+when the file did not already carry one.
+
+Audio with no language tag at all, common on older rips, is treated as
+the primary track and transcribed with automatic language detection
+rather than being skipped.
+
+Audio comes out in a fixed order, every track re-encoded to Opus:
+
+    1  English stereo downmix, dialogue boosted   (the default track)
+    2  Japanese stereo downmix, if Japanese exists
+    3  English original surround
+    4  Japanese original surround
+
+Everything else is dropped: other dubs, commentary tracks, and
+audio-description tracks, which are detected from their container flags
+rather than guessed at from the title.
+
+The downmix is built from the highest quality English source in the
+file, ranked lossless first, so TrueHD beats DTS-HD beats AC3.
+
+Subtitles start with a blank track labelled "Off", which is the one
+flagged default, so a player opens with nothing showing. English tracks
+come next, then Japanese, then anything else that survived.
+
+Audio sync is checked in windows across the whole file, and progress is
+reported as the scan walks through rather than only at the end, so
+drift shows up while the run is still going.
+
+
+NAMING AND METADATA
+=====================================================================
+
+Finished files are looked up, tagged, and renamed. The folder structure
+is never changed. Only the file is renamed, so a file that escapes its
+folder still says what it is.
+
+Shape:
+    Title-(Year)-Franchise-AV1_1080p.mkv
+    Show-(Year)-S05E01-Episode_Title-AV1_1080p.mkv
+
+Real examples:
+    The_Empire_Strikes_Back-(1980)-Star_Wars-AV1_1080p.mkv
+    Maleficent_Mistress_of_Evil-(2019)-AV1_1080p.mkv
+    Doctor_Who-(2005)-S05E01-The_Eleventh_Hour-AV1_1080p.mkv
+    Skyfall-(2012)-007-AV1_1080p.mkv
+
+Underscores replace spaces. Characters Windows forbids are stripped, so
+a colon in "Maleficent: Mistress of Evil" simply disappears. Hyphens
+inside a title are removed too, because a hyphen separates the fields.
+
+The franchise comes only from tags you already put in the original
+filename: 007, MCU, starwars, startrek, stargate, dcu, pixar, ghibli,
+lotr. It is never guessed from a database, because no database carries
+a field that means what you mean by it. No tag means the field is left
+out rather than filled with a guess.
+
+Identification runs cheapest first: parse the folder path and filename,
+read any IDs already in the file, then ask TMDB and confirm the answer
+against the file's runtime. PAL transfers run 4 percent short, which is
+recognised as a match rather than a mismatch. A runtime that disagrees
+badly is reported in the log rather than used to reject a match.
+
+Metadata is written into the file itself with mkvpropedit: title, year,
+plot, genre, TMDB and IMDb IDs, and the franchise. That takes seconds
+and no re-encode, and it travels with the file wherever it goes.
+
+Without a TMDB key, lookups are skipped and files keep their original
+names. Nothing else changes.
+
+
+THE STARTUP CHECK
+=====================================================================
+
+Before the queue starts, the pipeline runs a few one second test
+encodes to find out what this machine can actually do, rather than
+trusting what ffmpeg claims it was built with. You will see:
+
+    preflight: testing what this machine can actually encode
+        preflight av1_nvenc 8-bit    ok
+        preflight av1_nvenc 10-bit   ok
+
+NVENC is the encoding chip on the NVIDIA card. If the 10-bit test
+fails but 8-bit passes, the run continues in 8-bit and says so. If
+both fail, the run stops immediately with the reason, instead of
+failing every file in a long queue one at a time.
+
+If the GPU cannot encode AV1, the CPU encoder is tested and used
+instead, and the run carries on. The log says which one was picked.
+
+If SDR to HDR is ticked, libplacebo on Vulkan gets tested too. If it
+will not start, that option switches itself off for the run and the
+log says why. The rest of the batch carries on normally.
+
+This costs about three seconds and it is the fastest way to find out
+that a driver or an ffmpeg build is the problem.
+
+
+THE FOLDERS
+=====================================================================
+
+Input      P:\2_Storage\Film and TV\DownConvert\Input
+           Drop files here. Subfolders are read too, and the same
+           subfolder layout appears in the output.
+           Files under 5 MB are ignored.
+
+Output     P:\2_Storage\Film and TV\DownConvert\Output
+           Finished files land here, plus:
+             logs\pipeline.log      what happened, readable
+             logs\av1_trace.log     deep debug trace
+             _journal.json          what is done, drives resume
+             _analysis_report.txt   written by an analyze-only pass
+             failed\                anything that did not make it,
+                                    one .diag.log per file saying why
+             .tmp\                  work in progress, cleared at start
+
+Software   P:\2_Storage\Film and TV\DownConvert\Software
+           Both programs, the settings file, the launcher, the
+           version stamp, and any config backups.
+
+Logs go to a logs folder inside Output by default. The Log folder
+control in the window moves them somewhere else if you prefer.
+
+Source files are never touched, moved, or deleted. Ever. The pipeline
+only reads them.
+
+
+CONFIGURE
+=====================================================================
+
+Open this file in Notepad:
+
+    P:\2_Storage\Film and TV\DownConvert\Software\av1_pipeline_config.txt
+
+One setting per line, written as   key = value
+Anything after a # is a comment. Save, and the next run uses it.
+Paths are typed plainly, with single backslashes and no quotes.
+
+  src            Folder to read from.
+
+  dst            Folder to write to. It cannot sit inside src, and
+                 src cannot sit inside it.
+
+  hq_source_boost_pct
+                 Extra data rate for high quality sources, as a
+                 percentage. Default 30. Only applies to sources at
+                 2000 lines or more that are also 10-bit, so a 4K
+                 master gets a genuinely higher bitrate instead of
+                 being squeezed to the same number as a 1080p rip.
+                 0 turns it off.
+
+  metadata_enable
+                 Look films up, tag them, and rename them. Default 1.
+
+  tmdb_api_key   Free key from themoviedb.org/settings/api. Without it
+                 lookups are skipped and names are left alone.
+
+  rename_files   Rename finished files from the metadata. 0 tags only.
+
+  name_underscores / name_episode_title / name_tech_suffix
+                 Shape of the generated name. Defaults 1, 1, 1.
+
+  subs_langs     Which subtitle languages to keep, comma separated.
+                 Default eng,en,jpn,ja,jp,und. Subtitle tracks whose
+                 size the container does not report are always dropped
+                 regardless: copying one deadlocks the muxer.
+
+  sync_report_every / sync_warn_ms
+                 How often the audio sync check reports while it walks
+                 the file, in windows, and the offset in milliseconds
+                 that earns a warning. Defaults 12 and 120.
+
+  subs_generate  Generate a missing language rather than going
+                 without. Default 1.
+
+  whisper_model_dir / whisper_model / whisper_gpu
+                 Where the ggml model lives, which one to use, and
+                 whether to run it on the graphics card. The installer
+                 fetches ggml-large-v3-turbo.bin, about 1.6 GB.
+
+  translate_provider / translate_key / translate_endpoint /
+  translate_model
+                 Used only when there is no Japanese audio to
+                 transcribe. deepl or any OpenAI-compatible endpoint.
+                 Without a key, English subtitles are still generated
+                 and Japanese ones are skipped.
+
+  cq_offset      Shifts every quality number. Negative is better
+                 quality and larger files; each step is about 12
+                 percent bitrate. Default 0.
+
+                 NVENC's preset, tune, lookahead and adaptive
+                 quantisation are already at maximum, so bitrate is the
+                 only lever left on the GPU encoder. For better quality
+                 per byte rather than more bytes, set encoder = svtav1.
+
+  deband_mode    When deband runs: auto, always, or off. Default auto,
+                 which applies it only to sources under 10-bit where
+                 8-bit quantisation banding actually exists. This is a
+                 quality choice rather than a speed one: if you see
+                 banding in dark gradients on a 4K encode, set it to
+                 always and compare the two.
+
+  hwaccel        Hardware video decode: auto, cuda, or none. Default
+                 auto, which tests it at startup. This is the biggest
+                 speed gain available on 4K sources, because decoding
+                 4K HEVC in software pins the CPU and leaves the GPU
+                 encoder waiting for frames.
+
+  audio_fixed_layout
+                 Fixed four-track audio layout, default 1. See above.
+
+  audio_opus_per_ch
+                 Opus quality for surround tracks, kbps per channel.
+                 Default 128, well past transparent.
+
+  audio_langs    Which audio languages to keep, comma separated.
+                 Default eng,en,jpn,ja,jp. A remux ships every dub, and
+                 keeping all of them means many concurrent encoders and
+                 gigabytes of audio nobody plays. Blank keeps all.
+
+  audio_eng_stereo_only
+                 1 keeps only the generated stereo downmix for English
+                 rather than the surround masters. An English 2 channel
+                 track already in the source is kept as well. Default 1.
+
+  audio_mix_first
+                 1 lists the stereo downmix first. Default 1.
+
+  stall_timeout_sec
+                 Seconds with no forward progress before an encode is
+                 treated as hung and killed. Default 420. 0 disables it.
+
+  audio_keep_all Keep every audio track, English ordered first.
+                 Default 1. 0 keeps only the single best track.
+
+  audio_add_stereo_mix
+                 Add a stereo downmix of any English surround track,
+                 with the centre channel lifted for dialogue. Default 1.
+                 The surround track stays the default for playback;
+                 this one is there to be chosen.
+
+  audio_mix_centre
+                 Centre lift in that downmix. 1.0 is the normal
+                 downmix, which already lifts centre 30 percent.
+                 Default 1.25 lifts it further again.
+
+  audio_mix_enhance
+                 Dialogue enhancement strength on the downmix, 0 to 3,
+                 default 0.6. 0 turns it off.
+
+  subs_blank_first
+                 Add a blank subtitle track first so players open with
+                 subtitles off. Default 1.
+
+  audio_mode     What happens to the audio track.
+                   auto  keep the original stream when it is already a
+                         codec every player handles (AC3, E-AC3, AAC,
+                         DTS, TrueHD, FLAC, MP3, Opus, PCM), convert
+                         anything more awkward to Opus. Default, and it
+                         loses nothing on a normal rip.
+                   copy  never re-encode. Truest to the source.
+                   opus  always convert to Opus. Best quality per byte
+                         of any current lossy codec, handles surround.
+                   aac   always convert to AAC.
+
+  audio_downmix  1 folds surround down to stereo. Off by default, so a
+                 5.1 track stays 5.1. Turning it on forces a re-encode.
+
+  audio_denoise  1 runs a noise reducer over starved audio. Off by
+                 default, and it only engages below about 64 kbps a
+                 channel, so normal AC3 5.1 at 448k is never touched.
+
+  cas_strength   Contrast Adaptive Sharpen strength, 0 to 1, default
+                 0.30. Only used where no rescale happens. This is the
+                 FidelityFX CAS algorithm, but ffmpeg runs it on the
+                 CPU, so it behaves the same on any graphics card.
+                 0 turns it off.
+
+  sd_saturation  Saturation lift for sources at or below 720 lines.
+                 1.0 is unchanged, default 1.06. A deliberate look
+                 change rather than a restoration, so keep it modest.
+
+  sr_strength    How much of the AI upscale to keep, 0 to 100.
+                 The upscaler sees one frame at a time and has no memory
+                 of the frame before it, so it invents slightly
+                 different detail every frame. On a still background
+                 that reads as crawling or shimmering. Topaz and similar
+                 tools avoid it by feeding the model several frames at
+                 once, which is a property of the model and cannot be
+                 added here. This blends the model output back towards
+                 a plain lanczos upscale instead. 100 is the raw model,
+                 0 is no AI, 50 keeps half the invented detail and
+                 roughly halves the flicker with it. Default 50.
+
+  sr_stabilise   1 runs a temporal stabiliser after the blend, which
+                 averages each pixel across neighbouring frames only
+                 while the difference stays small. Still backgrounds
+                 settle, moving objects pass through untouched. Default
+                 1. Together with sr_strength = 50 this cut measured
+                 frame to frame shimmer by about 89 percent in testing.
+
+  sr_tmp_dir     Fast local folder for the upscaler's frame files.
+                 Blank uses the destination. The upscaler cannot stream,
+                 it only reads and writes image files, so every frame
+                 becomes a PNG and comes back bigger, thousands per
+                 chunk. If the destination is a network share, that
+                 write traffic is the slowest part of the whole job.
+                 Pointing this at a local SSD folder is the single
+                 biggest speed gain available. Uses 1 to 2 GB at a time.
+                 Example: sr_tmp_dir = C:\av1_scratch
+
+  encoder        Which encoder does the work.
+                   auto    test the GPU, fall back to the CPU if it
+                           cannot encode AV1. Right for almost everyone,
+                           and it returns to the GPU on its own once
+                           the GPU works again.
+                   nvenc   force the GPU, stop if it will not start.
+                   svtav1  force the CPU encoder.
+                 Files that go through the AI upscaler always encode on
+                 the CPU regardless, because the upscaler is already
+                 using the GPU for the whole run. Files that do not use
+                 the upscaler still go to the GPU. Setting nvenc
+                 explicitly overrides this.
+
+  svtav1_preset  CPU encoder speed, 0 slowest and best through 13
+                 fastest and worst. 4 to 8 is the useful range, 6 is a
+                 good start. Each step up roughly halves encode time.
+                 Ignored when the GPU encoder is in use.
+
+  ffmpeg_dir     Folder holding a specific ffmpeg.exe and ffprobe.exe
+                 to use instead of the one on PATH. Blank for normal
+                 use. This is the lever for an NVENC API mismatch, see
+                 the troubleshooting entry below.
+
+  log_dir        Where pipeline.log and av1_trace.log are written.
+                 Leave it blank for the default, a logs folder inside
+                 the output folder. Put a path here to send them
+                 somewhere else. The Log folder control in the window
+                 does the same thing without editing this file.
+
+  min_free_gb    The run stops before starting a file if free space
+                 on the destination drive is under this many GB.
+                 Default 20. Raise it if P: is getting tight.
+
+  sr_model       Which Real-ESRGAN model upscales sub-1080 files.
+                   realesr-animevideov3     fast, best on animation
+                   realesrgan-x4plus        slower, live action
+                   realesrgan-x4plus-anime  slower, anime line art
+                 Only used on sources below 1080 lines.
+
+  no_sr          1 skips Real-ESRGAN and upscales with lanczos
+                 instead. Much faster, noticeably softer. Leave at 0.
+
+  sdr_to_hdr     1 expands SDR sources into HDR10 color. Off by
+                 default because it changes the look of every SDR
+                 file in the batch. Try it on one file first.
+
+If you type something the program does not understand, it says so on
+screen, uses the default, and carries on. A typo never stops a batch.
+
+The tick boxes and number boxes in the window override the config file
+for that session, and what you last used is remembered in
+gui_settings.json next to the config file. To go back to exactly what
+the config file says, delete gui_settings.json and reopen the window.
+
+
+WHAT THE WINDOW CONTROLS DO
+=====================================================================
+
+Hover the mouse over any control for about half a second and a box
+appears explaining what it does, what it costs, and what any acronym
+in it stands for. Everything below is also in those hover boxes, so
+you do not need this file open while you work.
+
+Log folder      Where the two log files go.
+                  Output folder    a logs folder inside the
+                                   destination. The default, and it
+                                   keeps each batch's logs with its
+                                   results.
+                  Software folder  beside the program, so logs pile up
+                                   in one place across every batch.
+                  Custom           anywhere you pick.
+                The Open trace log button follows this setting.
+
+Analyze only    Reads and plans, encodes nothing, writes the report.
+Retry failed    Clears the failed marks so those files run again.
+Force redo      Re-encodes even files the journal already calls done.
+Skip SR         Same as no_sr above, for this run only.
+SDR to HDR      Same as sdr_to_hdr above, for this run only.
+SR model        Same as sr_model above, for this run only.
+Limit           Run only the first N files in the queue. 0 means all.
+                Useful for a first test: set it to 1.
+Min free GB     Same as min_free_gb above, for this run only.
+
+Selftest             Internal checks. No files touched, no GPU needed.
+Open destination     Opens the Output folder.
+Open trace log       Opens av1_trace.log, the deep debug log.
+
+The queue runs largest file first. Big files take longest and tell you
+most about whether the settings are right, so they go first on purpose.
+
+
+COMMON PROBLEMS
+=====================================================================
+
+"drive P:\ is not reachable from this session"
+    P: is not connected, or you ran the installer as administrator.
+    An administrator window does not see mapped network drives.
+    Connect P:, then double-click the .cmd normally.
+
+"python does not resolve yet"
+    Python was installed during this run and the PATH is stale.
+    Close the window and double-click the installer again.
+
+"realesrgan NOT found" in the verify block
+    Known problem on this machine. Outbound HTTPS from PowerShell
+    sometimes fails with WinError 10013 and the download dies.
+    Workaround: open this in a browser
+      https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0
+    download realesrgan-ncnn-vulkan-20220424-windows.zip, and extract
+    the contents into C:\ProgramData\realesrgan\ so that
+    C:\ProgramData\realesrgan\realesrgan-ncnn-vulkan.exe exists.
+    Until then, upscales fall back to lanczos and look softer.
+
+"dovi_tool NOT found"
+    Same cause. Run the installer once more, it usually lands on the
+    second try. Only affects Dolby Vision sources.
+
+"this ffmpeg build lists no av1_nvenc"
+    Wrong ffmpeg build, or the NVIDIA driver needs updating.
+    The full Gyan build is the one to have.
+
+Nothing happens when I double-click the desktop shortcut
+    Run Software\AV1 Pipeline.cmd instead. If that flashes and closes,
+    Python moved. Run the installer again to repoint the launcher.
+
+"av1_nvenc will not run: this ffmpeg was built for NVENC API x.y,
+the driver provides x.z"
+    Nothing is wrong with the card. ffmpeg builds are sometimes compiled
+    against an NVIDIA encoding SDK newer than any released driver
+    supports, and the GPU encoder then refuses to start.
+
+    The run does not stop. It moves to the CPU encoder and keeps going.
+    CPU AV1 is slower, hours per film rather than minutes, but the
+    quality is at least as good.
+
+    To get the GPU back, either wait for the NVIDIA driver version the
+    message names, or install an older ffmpeg build and point at it:
+      1. Download an older full build, for example ffmpeg 7.1, and
+         unpack it somewhere such as C:\ffmpeg-7.1-full_build
+      2. In the config file set
+           ffmpeg_dir = C:\ffmpeg-7.1-full_build\bin
+      3. Run again. The startup lines report which ffmpeg is in use.
+    Once the preflight passes, encoder = auto picks the GPU back up on
+    its own. Nothing else needs changing.
+
+"preflight av1_nvenc 10-bit FAILED"
+    The card or driver will not take 10-bit AV1. The run continues in
+    8-bit on its own. Updating the NVIDIA driver usually restores it.
+
+"preflight libplacebo vulkan FAILED"
+    SDR to HDR cannot run. It is switched off for that run and
+    everything else proceeds. The line underneath gives ffmpeg's own
+    reason. Usually the NVIDIA driver or the Vulkan runtime.
+
+An encode failed and the log shows "variant ... failed rc"
+    The line underneath now carries ffmpeg's own error text, and the
+    return code is decoded for you. That is normally enough to see the
+    cause without opening anything else. If not, the full command and
+    a longer error tail are in the .diag.log described below.
+
+The audio sounds worse than the source
+    Check the audio line at the top of the log. It should read
+    mode=auto downmix=False denoise=False. On a normal rip that copies
+    the original stream and touches nothing.
+    Earlier versions re-encoded every track to AAC, folded surround to
+    stereo, and ran a noise reducer over anything in AC3. Any file done
+    before V0.9 carries all three. Tick Force redo to run those again.
+    If a player refuses the copied stream, set audio_mode = opus.
+
+Subtitles I expected are missing
+    V0.14 dropped bitmap subtitle tracks whose size the container did
+    not report, which turned out to be most PGS tracks rather than only
+    the broken ones. V0.15 asks ffmpeg which streams it genuinely
+    cannot parse and drops only those, so the rest survive.
+
+An encode hangs part way through a Blu-ray remux
+    Fixed in V0.14. Some remuxes carry subtitle tracks whose picture
+    size the container never declares. Matroska needs that size to
+    write its header, so copying one leaves the muxer waiting forever
+    while the video queue fills behind it, and the encode stops dead
+    at the same frame every time. Those tracks are now detected and
+    dropped, with a line in the log naming them.
+
+Subtitle generation fails with a filter parsing error
+    The whisper filter separates its options with colons, so a Windows
+    path like C:/... has to be escaped and that escaping was the cause
+    of several failed attempts. V0.22 sidesteps it: ffmpeg runs with
+    its working directory set to the model's folder and both files are
+    named without any path at all, so nothing needs escaping. Two
+    fallback forms are tried if that is not possible, and the log names
+    which one succeeded.
+
+    The full ffmpeg error is now logged rather than the last few
+    hundred characters, which had been hiding the first and most
+    useful line.
+
+The GPU looks half idle during an encode
+    Task Manager's default GPU graph shows 3D and compute. NVENC is a
+    separate fixed-function block and does not appear there. Change one
+    of the graphs to "Video Encode" to see it.
+
+    The trace file now records this directly, once a minute:
+        resources during encode: ram ... gpu 48% / encoder 97% /
+        decoder 31%, vram 2.1/16.0 GB
+    An encoder figure near 100 means NVENC is the limit and no amount
+    of spare CPU will make it faster.
+
+The log just stops, with no error and no completion line
+    Every way the pipeline can end now writes a SESSION ENDED line:
+    normal exit, an unhandled error with its traceback, or a signal
+    asking it to stop. Log lines are flushed to disk as they are
+    written, so nothing is lost even if the process dies instantly.
+
+    A log that still ends with no SESSION ENDED line means the
+    operating system killed the process outright, and that is itself
+    the answer. The usual cause is running out of memory. The trace
+    file now records free RAM at startup, every minute during an
+    encode, and at exit, so a run that is heading that way is visible
+    before it dies. A warning appears below 1.5 GB free.
+
+    Other causes worth checking: closing the window, the machine
+    sleeping, or a power event.
+
+The speed figure keeps dropping and never recovers
+    Look at the position column, not the speed column. If position is
+    frozen and only speed falls, the encode has hung, not slowed down:
+    speed is position divided by elapsed time, so a stuck position
+    makes it decay on its own. The watchdog now catches this and fails
+    the file after stall_timeout_sec instead of sitting there.
+
+    Common causes on a large remux: reading the source and writing the
+    result across the same network drive at once, or a very large
+    number of audio and subtitle tracks being processed in parallel.
+    Copy one such file to a local SSD and run it from there to tell
+    the two apart.
+
+The AI upscale shimmers, backgrounds crawl or swim
+    Expected with a single frame model. Lower AI strength % in the
+    window, or sr_strength in the config. 50 is the default and halves
+    it; try 30 or 25 if it still shows. Keep sr_stabilise at 1.
+    realesr-animevideov3 is the video model and is steadier than
+    realesrgan-x4plus, which is built for still images.
+
+The AI upscale is desperately slow
+    Check the sr chunk line for the realtime figure. Below about 0.2x
+    means a feature film takes many hours. Two things to try, in order:
+      1. Set sr_tmp_dir to a local SSD folder. If the destination is a
+         network share this is usually the whole problem.
+      2. Switch SR model to realesr-animevideov3, which is far faster
+         than realesrgan-x4plus.
+    Skip SR turns the upscaler off entirely and uses lanczos, which is
+    minutes rather than hours.
+
+A file failed
+    Look in Output\failed\ for a .diag.log named after the file. It
+    holds the probe, the plan, the exact ffmpeg command, the error
+    output, and a suggested fix for that failure type.
+
+
+RUNNING FROM A TERMINAL
+=====================================================================
+
+Not needed for normal use. The window does everything. If you want it:
+
+    python "P:\2_Storage\Film and TV\DownConvert\Software\av1_pipeline_v0_1.py"
+
+With no flags it reads the config file. Flags beat the config file:
+
+    --src <path>        source folder
+    --dst <path>        destination folder
+    --limit N           run only the first N files
+    --analyze-only      plan and report, encode nothing
+    --selftest          internal checks
+    --retry-failed      re-queue the failed files
+    --force             re-encode even if the journal says done
+    --no-sr             skip Real-ESRGAN, use lanczos
+    --sdr-to-hdr        expand SDR into HDR10
+    --sr-model <name>   pick the upscale model
+    --upscale-cq N      quality for upscaled files, 16 to 30,
+                        default 28, higher means smaller
+    --min-free-gb N     free space floor on the destination
+    --log-dir <path>    folder for pipeline.log and av1_trace.log
+    --encoder <name>    auto, nvenc, or svtav1
+    --audio-mode <name> auto, copy, opus, or aac
+    --audio-downmix     fold surround down to stereo
+    --sr-strength N     how much AI upscale to keep, 0 to 100
+    --sr-tmp-dir <path> fast local folder for upscaler frames
+    --ffmpeg-dir <path> use a specific ffmpeg build
+    --keep-tmp          leave .tmp leftovers alone at startup
+
+=====================================================================
+END
+=====================================================================

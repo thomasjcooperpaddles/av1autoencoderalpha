@@ -1,0 +1,13 @@
+{
+ "src": "P:\\2_Storage\\Film and TV\\DownConvert\\Input",
+ "dst": "P:\\2_Storage\\Film and TV\\DownConvert\\Output",
+ "limit": "0",
+ "minfree": "20",
+ "sr_model": "realesr-animevideov3",
+ "no_subs": false,
+ "encoder": "nvenc",
+ "sr_strength": "50",
+ "audio_mode": "opus",
+ "log_mode": "Output folder",
+ "log_custom": ""
+}
