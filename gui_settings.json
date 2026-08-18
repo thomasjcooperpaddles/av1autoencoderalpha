@@ -1,9 +1,9 @@
 {
- "src": "P:\\2_Storage\\Film and TV\\DownConvert\\Input",
- "dst": "P:\\2_Storage\\Film and TV\\DownConvert\\Output",
+ "src": "P:/2_Storage/Film and TV/DownConvert/AVI_Files_For_Conversion",
+ "dst": "P:/2_Storage/Film and TV/DownConvert/Output",
  "limit": "0",
  "minfree": "20",
- "sr_model": "realesr-animevideov3",
+ "sr_model": "realesr-general-x4v3",
  "no_subs": false,
  "encoder": "nvenc",
  "sr_strength": "50",

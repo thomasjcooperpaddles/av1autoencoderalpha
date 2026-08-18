@@ -69,10 +69,42 @@ min_free_gb = 20
 cpu_max_pct = 88
 
 # Real-ESRGAN model used when a sub-1080 file gets upscaled.
-#   realesr-animevideov3    fast, best on animation and cartoons
-#   realesrgan-x4plus       slower, general purpose, live action
-#   realesrgan-x4plus-anime slower, tuned for anime line art
-sr_model = realesrgan-x4plus
+#
+# MEASURED on this card: 24 real frames at 720x480 - the active picture
+# of NTSC 480i - tile 768, output 1964x1080, fp16, then projected to the
+# 107,892 frames in one hour of 480i.
+#
+#   realesr-general-x4v3     10.1 fps    3.0 h per hour    205 MB
+#     THE DEFAULT. Same family as the one below, twice the depth.
+#     Better on live action and mixed material, which is most of what
+#     goes through here.
+#   realesr-animevideov3     18.1 fps    1.7 h per hour    204 MB
+#     anime and cartoons. Nearly twice as fast; the right choice for an
+#     animation batch.
+#   realesrgan-x4plus-anime   2.1 fps   14.6 h per hour   2912 MB
+#     heavier network tuned for anime line art. Nine times the runtime
+#     of the default.
+#
+# NOT offered: realesrgan-x4plus, at 0.7 fps and 43 hours per hour of
+# 480i. Anything not in the list is ignored with a printed note.
+#
+# The choice is a TIME choice. None of these comes close to the video
+# memory limit on a 16 GB card, and tile size changes throughput by
+# about 4 percent, so the tile ladder is about fitting, not speed.
+
+# Which upscaler backend to drive.
+#   auto   CUDA when torch has kernels for this card, else ncnn/Vulkan
+#   cuda   force CUDA
+#   ncnn   force the old Vulkan binary
+#   off    never upscale with a model; lanczos only
+#
+# CUDA is the default. The ncnn binary is dated 2022-04-24 and predates
+# Blackwell, whose 64 KB resource alignment it does not honour, and that
+# is what the 2026-08-16 GPU lockups were traced to. ncnn remains the
+# fallback and is the ONLY option on AMD, Intel and Apple Silicon.
+sr_backend = auto
+
+sr_model = realesr-general-x4v3
 
 # Extra data rate for genuinely high quality sources, as a percentage.
 # A 4K 10-bit master carries far more real detail than a broadcast rip,
@@ -585,8 +617,8 @@ scratch_min_free_gb = 50
 # x2 lands at 1056 and the last 2 percent is a near-free resize. Four
 # times fewer pixels to compute.
 #
-# NOTE: only realesr-animevideov3 has x2 and x3. realesrgan-x4plus is a
-# 4x model and nothing else, so forcing x2 with it will warn and use x4.
+# NOTE: only realesr-animevideov3 has x2 and x3, which is why it is now
+# the only model offered - the 4x-only models made this setting a lie.
 sr_scale = 2
 
 # Tile size handed to the upscaler, in pixels.
@@ -663,10 +695,30 @@ gpu_wait_sec = 300
 gpu_temp_max_c = 80
 gpu_cool_sec = 15
 
-# Seconds to idle between upscaler chunks. Without this the upscale
-# holds the GPU, the CPU and the disk at full tilt for eleven hours
-# without a break. Costs a few percent of throughput.
-sr_chunk_pause_sec = 2.0
+# Seconds to idle between upscaler chunks.
+#
+# Was 2.0, from when the lockups were thought to be a load problem. With
+# the chunk encode now running alongside the model instead of after it, a
+# chunk is about 6 seconds, so 2.0 was 20 percent of it - a quarter of an
+# hour of deliberate idling per film. The lockups were the 2022
+# ncnn/Vulkan binary on Blackwell, not load.
+#
+# gpu_temp_max_c above is the real protection: it refuses work when the
+# card is actually hot instead of pausing on a timer regardless.
+sr_chunk_pause_sec = 0.0
+
+# Prepare the NEXT file (probe, crop analysis, whisper, translation)
+# while this one is upscaling. 1 = yes, 0 = hold it back until the
+# upscale finishes.
+#
+# This was 0 for a long time because whisper stacked on the Vulkan
+# upscaler was the heaviest load the pipeline could produce, and the
+# machine locked up doing exactly that on 2026-08-09. The upscaler is
+# CUDA now and the lockup was traced to the Vulkan binary rather than to
+# load, so it is back on.
+#
+# IF THE MACHINE LOCKS UP DURING AN UPSCALE, SET THIS TO 0 FIRST.
+sr_prefetch_during = 1
 
 # Threads for load : process : save. The tool's own default is 1:2:2,
 # and with thousands of small PNG frames one decode thread leaves the
@@ -680,4 +732,24 @@ no_sr = 0
 # Set to 1 to expand SDR sources into HDR10 color. Off by default
 # because it changes the look of every SDR file in the batch.
 sdr_to_hdr = 0
+
+# Saturation gain applied during that SDR->HDR expansion.
+#
+# HARD CEILING 1.30. This path may never boost saturation by more than
+# 30 percent, whatever is written here; anything higher is clamped, and
+# the floor is 0.25.
+#
+# 1.0 is neutral. MEASURED on Son of Batman with source and output both
+# at 10-bit, the expansion leaves encoded chroma at 0.99x - it does not
+# boost the data. What changes is that the file is tagged bt2020/PQ, so
+# a display renders it in HDR mode, where SDR-derived material looks
+# brighter and more saturated than the SDR original. Same data,
+# different rendering. Set this BELOW 1.0 to tame that.
+#
+# Measured response of the filter, relative chroma at each gain:
+#   1.00 = 1.00x      0.60 = 0.57x      0.40 = 0.36x
+#   0.50 = 0.47x      0.35 = 0.31x      0.30 = 0.26x
+#
+# Only applies when sdr_to_hdr is on. Ignored otherwise.
+sdr_to_hdr_saturation = 1.0
 

@@ -96,7 +96,7 @@ SANITY_TOTAL_GAP_SEC = 30.0  # total silence inserted mid-film
 # Moves with av1_pipeline_v0_1.VERSION, which selftest enforces. This
 # tool rewrites finished files by hand, so a report from it has to say
 # which build produced the rewrite.
-VERSION = "0.243"
+VERSION = "0.256"
 
 
 def _run(cmd, timeout=None):

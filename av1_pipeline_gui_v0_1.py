@@ -33,7 +33,11 @@ SETTINGS = HERE / "gui_settings.json"
 CONFIG = HERE / "av1_pipeline_config.txt"
 LOG_CAP_LINES = 4000
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-SR_MODELS = ["realesr-animevideov3", "realesrgan-x4plus",
+# Fastest first. MEASURED on this card at 720x480, output 1964x1080,
+# projected to one hour of 480i: animevideov3 1.7 h, general-x4v3 3.0 h,
+# x4plus-anime 14.6 h. The 23-block realesrgan-x4plus is deliberately not
+# here at 43 h a film.
+SR_MODELS = ["realesr-animevideov3", "realesr-general-x4v3",
              "realesrgan-x4plus-anime"]
 LOG_MODES = ["Output folder", "Software folder", "Custom"]
 ENCODERS = ["auto", "nvenc", "svtav1"]
@@ -55,7 +59,7 @@ TARGET_RES_FLAG = {"1080p": "1080", "4K": "2160"}
 # av1_pipeline_config.txt, then gui_settings.json. Note that the last of
 # those is deliberately NOT consulted for no_sr and sdr_to_hdr; see
 # load_settings for why.
-DEFAULT_SR_MODEL = "realesrgan-x4plus"
+DEFAULT_SR_MODEL = "realesr-general-x4v3"
 DEFAULT_ENCODER = "nvenc"
 DEFAULT_AUDIO_MODE = "opus"
 # 1080p, as instructed. Like no_sr and sdr_to_hdr this is library-wide
@@ -139,11 +143,13 @@ def build_args(py, pipeline, s):
     # the list above, on the theory that the pipeline's own default
     # would then apply. It does not: with no flag the pipeline falls
     # back to av1_pipeline_config.txt, not to its built-in default. So
-    # the one selection that most needed to reach it never did -
-    # SR_MODELS[0] is realesr-animevideov3, the config says
-    # realesrgan-x4plus, and choosing animevideov3 in this window
-    # emitted nothing at all and ran x4plus. The dropdown could not
-    # select the value it was showing.
+    # the one selection that most needed to reach it never did - when
+    # the config still named realesrgan-x4plus, choosing animevideov3 in
+    # this window emitted nothing at all and ran x4plus. The dropdown
+    # could not select the value it was showing. Only one SR model is
+    # offered now, but the flag is still always emitted: a stale
+    # gui_settings.json outranks the config, which is exactly how the
+    # 08-17 run ended up on x4plus at 0.06x realtime.
     am = (s.get("audio_mode") or "").strip()
     if am:
         a += ["--audio-mode", am]
@@ -286,9 +292,16 @@ TIPS = {
 
 "srmodel": "SR stands for super resolution, the AI upscaler used on "
            "files smaller than 1080 lines. The tool is Real-ESRGAN.\n\n"
-           "realesr-animevideov3: fastest, best on animation and cartoons.\n"
-           "realesrgan-x4plus: slower, general purpose, live action.\n"
-           "realesrgan-x4plus-anime: slower, tuned for anime line art.\n\n"
+           "The difference between these is TIME, not quality ceiling "
+           "and not video memory - all three peak well under this "
+           "card's limit. Measured at 720x480, per hour of 480i:\n\n"
+           "realesr-general-x4v3: 3.0 h. DEFAULT. Twice the depth of the "
+           "one below; better on live action and mixed material.\n"
+           "realesr-animevideov3: 1.7 h. Anime and cartoons, and nearly "
+           "twice as fast - the right pick for an animation batch.\n"
+           "realesrgan-x4plus-anime: 14.6 h. A heavier network tuned "
+           "for anime line art. Nine times slower than the default for "
+           "a difference you may not see on a downscale to 1080.\n\n"
            "Only used on sources under 1080 lines. Anything already "
            "1080 or larger ignores this.",
 

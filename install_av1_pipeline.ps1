@@ -181,10 +181,8 @@ min_free_gb = 20
 cpu_max_pct = 88
 
 # Real-ESRGAN model used when a sub-1080 file gets upscaled.
-#   realesr-animevideov3    fast, best on animation and cartoons
-#   realesrgan-x4plus       slower, general purpose, live action
-#   realesrgan-x4plus-anime slower, tuned for anime line art
-sr_model = realesrgan-x4plus
+#   realesr-animevideov3    the only model offered
+sr_model = realesr-general-x4v3
 
 # Extra data rate for genuinely high quality sources, as a percentage.
 # A 4K 10-bit master carries far more real detail than a broadcast rip,

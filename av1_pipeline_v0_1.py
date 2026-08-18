@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =====================================================================
-# av1_pipeline_v0_1.py   V0.241   2026-08-11
+# av1_pipeline_v0_1.py   V0.256   2026-08-17
 #
 # The build number lives in VERSION below and moves by 0.001 on every
 # change. This banner had read "V0.16 2026-08-02" for eight builds.
@@ -42,10 +42,40 @@
 #     remux repair, progressive drift fails the file
 #   - failures land in <dst>\failed with a per-file diagnostic log
 #   - journal resume, disk space checks, system sleep blocked
+#
+# ---------------------------------------------------------------------
+# TEST HYGIENE - ALWAYS CLEAN UP AFTER A TEST RUN.
+#
+# Every test leaves things behind, and several of them are not in the
+# obvious place. Before reporting a test finished, remove:
+#
+#   * TEST FIXTURES OUT OF THE SOURCE QUEUE FOLDER. This is the dangerous
+#     one. scan_sources walks the tree and takes anything over 5 MB with
+#     a video extension, so a clip left there is silently encoded on the
+#     next real run and lands in the library under a made-up name. Cut
+#     test clips into a scratch folder and point --src at that instead.
+#   * the test destination, including its logs/ and failed/ folders and
+#     _journal.json - a stale journal entry marks a real file "done" or
+#     "encoding" and it will be skipped or resumed wrongly later.
+#   * <scratch disk>\av1_scratch\* - normally swept by the next run's
+#     orphan pass, but a killed test can leave GBs of PNGs behind. Check
+#     it rather than trusting the sweep.
+#   * .srt files in the WHISPER MODEL FOLDER. The bare-name whisper
+#     attempt runs with cwd set there, so anything it writes lands
+#     beside the model. There are files in there from 2026-08-03 that
+#     nobody meant to keep.
+#   * frame dumps, .wav probes and one-off scripts in the temp dir.
+#
+# The rule that keeps this cheap: a test writes ONLY inside a directory
+# it created for itself, and deletes that directory when it is done. If a
+# test needs to write anywhere else, that is the thing to clean up by
+# hand and to say so in the report.
+# ---------------------------------------------------------------------
 # =====================================================================
 
 import argparse
 import collections
+import concurrent.futures as cf
 import ctypes
 import hashlib
 import json
@@ -88,8 +118,18 @@ from pathlib import Path
 # that no longer refuses to run on a machine with no NVENC.
 # 0.243: the startup banner no longer tells the operator to set
 # sr_tmp_dir when leaving it blank is now the recommended setting.
-VERSION = "0.243"
-VERSION_DATE = "2026-08-12"
+# 0.244: an upscaler with no model beside it now falls back to lanczos
+# instead of failing every file under 1080 lines. Found while checking
+# what the installer actually downloads: Real-ESRGAN-ncnn-vulkan's own
+# release zips contain no weights at all.
+# 0.245: subtitle and audio track layout. Three faults were shipping an
+# English-tagged track containing Japanese - argos never installed the
+# ja->en pair, a failed translation wrote the untranslated original, and
+# source language tags were believed over the text. Plus the specified
+# fixed layout: a1 English boosted, a2 English original, a3 Japanese
+# unboosted; s1 forced/English/blank, s2 English, s3 Japanese.
+VERSION = "0.256"
+VERSION_DATE = "2026-08-17"
 IS_WIN = platform.system() == "Windows"
 
 # ---------------------------------------------------------------------
@@ -355,7 +395,7 @@ AUDIO_CONFORM_STEP = 60.0                 # one adjustment a minute
 # The segment is longer to match: correlating 1.2 s of audio across a
 # 5 s window is not enough signal to pick the right peak.
 SR_CHUNK_SEC = 10.0                       # frames per realesrgan batch
-SR_MODEL_DEFAULT = "realesr-animevideov3"
+SR_MODEL_DEFAULT = "realesr-general-x4v3"
 # Upscale factor. 0 lets the code pick the smallest the model supports
 # that clears 1080 lines; a number forces it. x2 on a 528-line film
 # lands at 1056 and the last 2 pct is a near-free resize, against x4
@@ -378,6 +418,11 @@ SR_TILE = 0
 # takes the display driver down and, on 2026-08-06, the whole machine
 # with it. 98 leaves the compositor and anything else on the desktop
 # room to breathe.
+# The ceiling every resource cap is clamped to. Nothing this pipeline
+# drives may take 100 pct of anything: the desktop, the compositor and
+# the OS need room, and on a GPU an allocation that does not fit resets
+# the display driver rather than failing politely.
+UTILISATION_CEILING_PCT = 98
 GPU_MAX_PCT = 98
 # Seconds to let the driver actually reclaim video memory after a kill.
 # nvidia-smi reports the old figure for a short while after a process
@@ -393,11 +438,25 @@ GPU_WAIT_SEC = 300
 # refusal to keep leaning on one.
 GPU_TEMP_MAX_C = 80
 GPU_COOL_SEC = 15
-# Seconds to idle between upscaler chunks. The upscale holds the GPU,
-# the CPU and the disk at full tilt for hours without a break; a short
-# gap every chunk costs a few percent of throughput and lets the whole
-# machine, not just the card, come off the ceiling.
-SR_CHUNK_PAUSE_SEC = 2.0
+# Seconds to idle between upscaler chunks.
+#
+# Was 2.0, added when the lockups were believed to be a load problem. It
+# is not a few percent any more: with the model at 6.2 s and the encode
+# hidden underneath it, two seconds is TWENTY PERCENT of a chunk, which
+# on a 447-chunk film is a quarter of an hour of deliberate idling. And
+# the load theory is dead - the lockups were the ncnn/Vulkan binary on
+# Blackwell, and the card died cold.
+#
+# GPU_TEMP_MAX_C and gpu_wait_for_cool remain, and they are the real
+# protection: they refuse work when the card is actually hot, rather than
+# idling on a timer whether it needs it or not. Raise this again if the
+# machine ever locks up during a CUDA upscale.
+SR_CHUNK_PAUSE_SEC = 0.0
+# Let the background preparation of the NEXT file run while this one is
+# upscaling. See process_file for the history; 0 restores the old
+# behaviour of holding it back, and is the first thing to try if the
+# machine locks up again.
+SR_PREFETCH_DURING = 1
 SR_VRAM_MB = 15000            # absolute cap; the percentage above wins
 # Held back for the concurrent NVENC session and the desktop compositor.
 #
@@ -433,11 +492,66 @@ SR_VRAM_RESERVE_MIN_MB = 700  # compositor headroom, even with no NVENC
 SR_TILE_MAX = 896
 # what a 400 px tile costs at each scale, from ncnn's auto table
 SR_TILE_COST_400 = {2: 1300.0, 3: 3300.0, 4: 1690.0}
+# The factor the CUDA networks actually compute at, whatever factor is
+# asked for. All three released .pth files are x4 networks; ncnn ships
+# separate x2/x3 weights but the PyTorch release does not. Anything that
+# sizes memory or reasons about oversampling must use THIS on CUDA, not
+# the requested factor.
+SR_CUDA_NATIVE_SCALE = 4
 # Thread counts for load : process : save. The tool's own default is
 # 1:2:2, and with thousands of small PNGs a single decode thread leaves
 # the card waiting on the disk rather than computing.
 SR_THREADS = "4:4:4"
-SR_MODELS = ("realesr-animevideov3", "realesrgan-x4plus",
+# Which upscaler to drive.
+#   auto   CUDA when torch has kernels for this card, else ncnn/Vulkan
+#   cuda   force CUDA; the run falls back to lanczos if it will not start
+#   ncnn   force the old Vulkan binary
+#   off    never upscale with a model; lanczos only
+#
+# CUDA is the default because the ncnn binary is dated 2022-04-24 and
+# predates Blackwell, whose 64 KB resource alignment it does not honour
+# - which is what the 2026-08-16 GPU lockups were traced to. Measured
+# on 120 real frames: CUDA 19.56 fps against ncnn 6.07, half the video
+# memory, and output matching to 52.9 dB PSNR.
+#
+# ncnn stays as the fallback and is still the ONLY option on machines
+# with no CUDA, which includes AMD, Intel and Apple Silicon.
+SR_BACKEND = "auto"
+# Three models, ordered fastest first. The cost between them is enormous
+# and it is entirely throughput, not memory.
+#
+# MEASURED on this card, 2026-08-17: 24 real frames at 720x480 (the
+# active picture of NTSC 480i), tile 768, output 1964x1080, fp16, and
+# projected to the 107,892 frames in one hour of 480i:
+#
+#   realesr-animevideov3      18.1 fps    1.7 h/h     204 MB peak
+#   realesr-general-x4v3      10.1 fps    3.0 h/h     205 MB peak
+#   realesrgan-x4plus-anime    2.1 fps   14.6 h/h    2912 MB peak
+#   realesrgan-x4plus          0.7 fps   43.1 h/h    2682 MB peak
+#
+# x4plus stays out at 43 hours a film. The other three are offered.
+#
+# CORRECTION to what 0.251 said when it cut this list to one entry. The
+# reason given there - that the x4plus pair are 4x-only networks with no
+# x2/x3 weights and so compute sixteen times the pixel area - IS VOID ON
+# CUDA, and 0.253 is what made it void: the PyTorch release of
+# animevideov3 is x4-only as well, so every model here computes x4 and
+# the output is reduced once to the target. The x2/x3 distinction was an
+# ncnn property. The surviving reason to prefer animevideov3 is speed,
+# and speed alone is a tradeoff for the operator to make, not grounds for
+# removing the option.
+#
+# What actually went wrong on 2026-08-17 was settings precedence: a stale
+# gui_settings.json pinned x4plus and outranked the config, projecting 22
+# hours for one film. That is fixed in the GUI and in the saved settings,
+# which is the right place for it.
+#
+# Tile size barely matters here - 640 against 768, 1024 and none spans
+# 4 pct - so the tile ladder is about fitting, not speed.
+#
+# A config or saved GUI value naming something not in this tuple is reset
+# to SR_MODEL_DEFAULT with a printed note; --sr-model rejects it.
+SR_MODELS = ("realesr-animevideov3", "realesr-general-x4v3",
              "realesrgan-x4plus-anime")
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console flash
                                           # when running under the gui
@@ -464,6 +578,33 @@ STD_DEBAND = "deband=1thr=0.008:2thr=0.008:3thr=0.008:4thr=0.008:range=16:blur=1
 # saturation lift for standard definition sources. this is a deliberate
 # look change, not a restoration; keep it modest.
 SD_SATURATION = 1.06
+# Saturation gain applied by libplacebo on the SDR->HDR expansion, and
+# the hard ceiling on it.
+#
+# MEASURED 2026-08-17 on Son of Batman, source against shipped output,
+# BOTH AT 10-BIT: SATAVG 57.20 against 56.44, a ratio of 0.99. The
+# expansion does NOT boost encoded chroma. An earlier reading of "4x"
+# came from comparing an 8-bit source against a 10-bit output -
+# signalstats reports raw code values, and 10-bit code values are four
+# times 8-bit ones for the same colour. That was a harness error, not a
+# finding.
+#
+# What is real is that the output is tagged bt2020nc/smpte2084, so a
+# display renders it in HDR mode, where SDR-derived material looks
+# brighter and more saturated than the SDR original. Same data, different
+# rendering. This gain is the lever for that, and it is the only one
+# libplacebo offers that acts directly on saturation.
+#
+# The CEILING is the point: this path may never boost saturation by more
+# than 30 percent, whatever the config asks for. Below 1.0 is allowed and
+# is how the HDR rendering gets tamed.
+#
+# Measured response of the filter, relative chroma at gain g:
+#   g=1.00  1.00x     g=0.60  0.57x     g=0.40  0.36x
+#   g=0.50  0.47x     g=0.35  0.31x     g=0.30  0.26x
+SDR_TO_HDR_SATURATION = 1.0
+SDR_HDR_SAT_MAX = 1.30
+SDR_HDR_SAT_MIN = 0.25
 # Deband policy. "auto" applies it only to sources under 10-bit, where
 # there is 8-bit quantisation banding to actually fix. "always" applies
 # it everywhere, which costs real CPU at 4K and injects dither into a
@@ -866,9 +1007,57 @@ class Journal:
         self.save()
 
     def save(self):
+        """Write the journal. NEVER raises into the caller.
+
+        os.replace() is an atomic rename over an existing file, and on
+        an SMB share that can be refused outright:
+
+          PermissionError: [WinError 5] Access is denied:
+          '\\\\192.168.2.50\\shared\\...\\_journal.tmp' ->
+          '...\\_journal.json'
+
+        which is what happened on 2026-08-16 with the destination on a
+        network share. The journal is bookkeeping - it records what has
+        been done so a run can resume - and a bookkeeping write failing
+        must never cost a file that took hours to encode. It killed one
+        outright, from inside journal.update(rel, status="analyzing").
+
+        So: retry, because the usual cause is another handle briefly
+        open on the target; then fall back to writing in place, which
+        gives up atomicity but keeps the run alive; and if even that
+        fails, log it and carry on. A journal that is momentarily stale
+        costs a re-encode on resume. An exception here costs the file.
+        """
+        blob = json.dumps(self.data, indent=1)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=1), encoding="utf-8")
-        os.replace(tmp, self.path)
+        last = None
+        for attempt in range(4):
+            try:
+                tmp.write_text(blob, encoding="utf-8")
+                os.replace(tmp, self.path)
+                if attempt:
+                    log.debug("journal written on attempt %d" % (attempt + 1))
+                return True
+            except OSError as e:
+                last = e
+                time.sleep(0.4 * (attempt + 1))
+        # Atomic replace will not work here. Write straight to the file:
+        # a torn journal is recoverable (it is re-read as corrupt and set
+        # aside), a dead run is not.
+        try:
+            self.path.write_text(blob, encoding="utf-8")
+            log.warning("journal: atomic replace refused (%s); wrote it "
+                        "directly instead. A destination on a network "
+                        "share does this." % last)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        except OSError as e:
+            log.error("journal could NOT be written (%s). The run "
+                      "continues, but it will not resume cleanly." % e)
+            return False
 
     def clear_failed(self):
         # drops failed entries so those files queue again on this run
@@ -989,6 +1178,11 @@ def placebo_hlg_to_pq():
 
 
 def placebo_filter():
+    """The SDR->HDR expansion, with saturation held under a hard ceiling.
+
+    Returns:
+        str: the libplacebo filter string.
+    """
     opts = placebo_opts()
     parts = ["libplacebo=colorspace=bt2020nc",
              "color_primaries=bt2020", "color_trc=smpte2084"]
@@ -998,7 +1192,27 @@ def placebo_filter():
         if name in opts:
             parts.append(name + "=perceptual")
             break
+    # NEVER MORE THAN A 30 PERCENT LIFT. The clamp is applied here as
+    # well as at config load, so no other caller can route around it, and
+    # the filter simply omits the option when the gain is neutral.
+    if "saturation" in opts:
+        g = sdr_hdr_saturation()
+        if abs(g - 1.0) > 0.001:
+            parts.append("saturation=%.3f" % g)
     return ":".join(parts)
+
+
+def sdr_hdr_saturation():
+    """The SDR->HDR saturation gain, clamped to its permitted range.
+
+    Returns:
+        float: within [SDR_HDR_SAT_MIN, SDR_HDR_SAT_MAX].
+    """
+    try:
+        g = float(SDR_TO_HDR_SATURATION)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(SDR_HDR_SAT_MIN, min(SDR_HDR_SAT_MAX, g))
 
 
 def nvenc_verdict(err):
@@ -1538,6 +1752,12 @@ def probe_file(path):
                 "codec": s.get("codec_name") or "",
                 "lang": ((s.get("tags") or {}).get("language")
                          or "und").lower(),
+                # The track's own name. Never collected before, so two
+                # English tracks in one file arrived in the output as two
+                # identically-labelled entries with nothing to choose
+                # between them - which is what a player shows for
+                # Fullmetal Alchemist: "English" twice.
+                "title": ((s.get("tags") or {}).get("title") or "").strip(),
                 "forced": bool(d.get("forced")),
                 "sdh": bool(d.get("hearing_impaired"))})
         elif ct == "attachment":
@@ -1648,7 +1868,94 @@ def probe_video_duration(path):
                 return n / fps
         except Exception:
             pass
-    return probe_duration(path)
+    # 4. the LAST VIDEO PACKET's timestamp.
+    #
+    # Before falling back to the container, which is the length of the
+    # LONGEST TRACK and therefore wrong whenever anything outlasts the
+    # picture. Trigun Badlands Rumble is the case: a 2012 remux with no
+    # stream duration, no DURATION tags and no frame count, whose
+    # Japanese FLAC runs 5463.5 s against 5433.4 s of video. The encode
+    # reproduced the picture exactly and was FAILED for being 30 s short
+    # of a figure that never described the picture at all - a 9 GB
+    # encode thrown away over a correct result.
+    cd = probe_duration(path)
+    lp = probe_last_video_packet(path, cd)
+    if lp > 0:
+        return lp
+    return cd
+
+
+def probe_video_frames(path, dur=0.0, fps=0.0):
+    """How many video frames the source ACTUALLY has.
+
+    Not dur * fps. That product is an estimate built from two figures
+    that are themselves rounded, and on a fractional NTSC rate it lands
+    a few frames off - which on the upscale path becomes a few frames of
+    real drift, because the output's length is decided entirely by how
+    many frames come out of the chunker.
+
+    ANY DEVIATION IN LENGTH BREAKS SYNC. The audio is taken straight
+    from the master on its own timeline; if the picture ends up even a
+    handful of frames longer or shorter, the two slide apart and stay
+    apart. So the count has to be counted, not calculated.
+
+    -count_packets reads the container index without decoding, which is
+    seconds rather than minutes, and for every codec this pipeline
+    handles one video packet is one frame.
+
+    Returns:
+        int: frame count, or 0 if it could not be counted, in which case
+        the caller falls back to the estimate and says so.
+    """
+    cmd = [TOOLS["ffprobe"], "-v", "error", "-select_streams", "v:0",
+           "-count_packets", "-show_entries", "stream=nb_read_packets",
+           "-of", "csv=p=0", str(path)]
+    rc, out, err = run(cmd, timeout=1800)
+    if rc == 0:
+        n = int(frac((out or "").strip().split(",")[0]))
+        if n > 0:
+            return n
+    log.debug("could not count packets in %s: %s" % (path, (err or "")[:200]))
+    return 0
+
+
+def probe_last_video_packet(path, container_dur=0.0):
+    """Where the video stream's last packet ends, in seconds.
+
+    Reads packet headers only - no decoding - and seeks to shortly
+    before the expected end rather than walking the file, which is the
+    difference between 0.3 s and a minute on a feature. Measured on the
+    Trigun remux: 0.3 s seeking, 57 s from the start of the file, and
+    both give 5433.427 against a true 5433.42.
+
+    Args:
+        path: file to probe.
+        container_dur: the container's own duration, used only to pick
+            where to start reading. 0 reads from the beginning, which
+            is correct but slow, so it is used only for short files.
+
+    Returns:
+        float: end of the last video packet, or 0.0 if it cannot be
+        determined - in which case the caller keeps its own fallback.
+    """
+    cmd = [TOOLS["ffprobe"], "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "packet=pts_time,duration_time"]
+    if container_dur and container_dur > 180.0:
+        cmd += ["-read_intervals", "%.3f" % max(0.0, container_dur - 120.0)]
+    cmd += ["-of", "csv=p=0", str(path)]
+    rc, out, err = run(cmd, timeout=600)
+    if rc != 0 or not out.strip():
+        return 0.0
+    best = 0.0
+    for line in out.splitlines():
+        parts = line.strip().split(",")
+        if not parts or not parts[0]:
+            continue
+        t = frac(parts[0])
+        d = frac(parts[1]) if len(parts) > 1 else 0.0
+        if t > 0:
+            best = max(best, t + d)
+    return best
 
 
 def track_census(path):
@@ -2475,6 +2782,9 @@ def build_plan(info, an, sdr_to_hdr=False):
         colorconv = placebo_filter()
         out_space = "hdr10"
         notes.append("sdr_expanded_to_hdr10_libplacebo")
+        _g = sdr_hdr_saturation()
+        if abs(_g - 1.0) > 0.001:
+            notes.append("sdr_hdr_saturation_%.2f" % _g)
     if colorconv:
         # colour math runs at native size, ahead of any scaling
         chain.append(colorconv)
@@ -3554,6 +3864,41 @@ def compensate_af_latency(af, log=None, label="audio chain"):
     return af + ",atrim=start=%.6f,asetpts=PTS-STARTPTS" % (lat / 1000.0)
 
 
+def boost_only_filter(log=None, src_start=0.0):
+    """The dialogue enhancement chain WITHOUT a downmix in front of it.
+
+    Slot a1 is specified as the dialogue-boosted track. When the English
+    source is already stereo there is nothing to fold, but the boost is
+    still wanted - so this is stereo_mix_filter's chain with the pan
+    removed.
+
+    An earlier version put an already-stereo track into a1 untouched, on
+    the reasoning that processing it "would only colour it". That is
+    true and it is also the point: a1 exists to be the easy-listening
+    track, and a2 carries the same audio unmodified for anyone who wants
+    it clean.
+
+    The same start-time rule applies as in stereo_mix_filter: the
+    latency trim ends in asetpts=PTS-STARTPTS, which rebases the track,
+    and rebasing a stream that legitimately starts at +2 s throws it two
+    seconds early. Compensate only where it is provably safe.
+    """
+    chain = ["alimiter=limit=0.97"]
+    if AUDIO_MIX_ENHANCE > 0:
+        chain.append("dialoguenhance=original=1:enhance=%.2f"
+                     % AUDIO_MIX_ENHANCE)
+        chain.append("aformat=channel_layouts=stereo")
+    chain.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    chain.append("aformat=channel_layouts=stereo")
+    if abs(src_start) > 0.05:
+        if log:
+            log.warning("    this track starts at %+.3f s, so the latency "
+                        "trim is skipped; the boosted track runs ~37 ms "
+                        "late, well inside tolerance." % src_start)
+        return ",".join(chain)
+    return compensate_af_latency(",".join(chain), log, "dialogue boost")
+
+
 def stereo_mix_filter(layout, log=None, src_start=0.0):
     # centre carries the dialogue, so it is lifted rather than folded in
     # flat. the limiter catches the peaks that lift creates.
@@ -3721,45 +4066,89 @@ def audio_args(info, plan, extra=None, input_index=0):
         if "single_audio_track_kept" not in plan["notes"]:
             plan["notes"].append("single_audio_track_kept_lang_%s"
                                  % (auds[0].get("lang") or "und"))
+    # -----------------------------------------------------------------
+    # THE TRACK LAYOUT, exactly as specified:
+    #
+    #   a1  English, DIALOGUE BOOSTED, folded to stereo.
+    #       With no English at all, the best foreign track takes this
+    #       slot instead - at its ORIGINAL LAYOUT and with NO boost,
+    #       because boosting dialogue in a language the viewer is
+    #       reading subtitles for helps nobody, and folding a foreign
+    #       master to stereo would throw away channels for no gain.
+    #   a2  English ORIGINAL, native layout, unboosted. Only when an
+    #       English track exists - it is the untouched counterpart to a1.
+    #   a3  Japanese, native layout, NEVER boosted. Only when a1 and a2
+    #       are both English, which is to say only when the film has
+    #       English audio of its own.
+    #
+    # The previous layout put a boosted Japanese downmix at a2 and threw
+    # the English master away entirely (audio_eng_stereo_only), so an
+    # English film kept no original English track at all.
+    # -----------------------------------------------------------------
     slots = []
-    # 1 and 2: the stereo downmixes, which is what most playback uses
-    for src, lang, label in ((eng, "eng", "English"),
-                             (jpn, "jpn", "Japanese")):
-        if src is None:
-            continue
-        if src.get("ch", 0) <= 2:
-            # already stereo, so there is nothing to fold down. it goes
-            # straight into the stereo slot instead of being processed
-            # through a downmix that would only colour it.
-            slots.append({"src": src, "filter": None, "stereo": True,
-                          "lang": lang, "native_stereo": True,
-                          "title": "%s stereo" % label})
-            continue
-        filt = stereo_mix_filter(src["layout"],
-                                 src_start=src.get("start", 0.0) or 0.0)
+    if eng is not None:
+        # a1: English, boosted.
+        if eng.get("ch", 0) > 2:
+            filt = stereo_mix_filter(eng["layout"],
+                                     src_start=eng.get("start", 0.0) or 0.0)
+            title = "English stereo downmix (dialogue boosted)"
+        else:
+            # Already stereo, so there is nothing to fold - but a1 is
+            # specified as the boosted track, so it still gets the
+            # enhancement chain, just without a pan in front of it.
+            filt = boost_only_filter(src_start=eng.get("start", 0.0) or 0.0)
+            title = "English stereo (dialogue boosted)"
         if filt:
-            slots.append({"src": src, "filter": filt, "stereo": True,
-                          "lang": lang, "native_stereo": False,
-                          "title": "%s stereo downmix (dialogue boosted)"
-                                   % label})
-    # 3 and 4: the original surround masters, re-encoded to Opus
-    for src, lang, label in ((eng, "eng", "English"),
-                             (jpn, "jpn", "Japanese")):
-        if src is None or src.get("ch", 0) <= 2:
-            # a stereo source is already slot 1 or 2; repeating it as an
-            # "original" would just duplicate the same audio
-            continue
-        slots.append({"src": src, "filter": None, "stereo": False,
-                      "lang": lang, "native_stereo": False,
-                      "title": "%s %dch" % (label, src.get("ch", 2))})
+            slots.append({"src": eng, "filter": filt, "stereo": True,
+                          "lang": "eng", "native_stereo": False,
+                          "title": title})
+        else:
+            # No usable filter chain for this layout: carry the track
+            # rather than dropping the film's primary audio.
+            slots.append({"src": eng, "filter": None, "stereo": True,
+                          "lang": "eng", "native_stereo": True,
+                          "title": "English stereo"})
+        # a2: the English original, untouched but for the codec.
+        slots.append({"src": eng, "filter": None, "stereo": False,
+                      "lang": "eng", "native_stereo": False,
+                      "title": "English original %dch"
+                               % (eng.get("ch", 2) or 2)})
+        # a3: Japanese, unboosted, only now that 1 and 2 are English.
+        if jpn is not None:
+            slots.append({"src": jpn, "filter": None, "stereo": False,
+                          "lang": "jpn", "native_stereo": False,
+                          "title": "Japanese %dch" % (jpn.get("ch", 2) or 2)})
+    else:
+        # No English audio anywhere. The best foreign track leads, at
+        # its own layout and unboosted.
+        primary = jpn or plan["audio"] or (auds[0] if auds else None)
+        if primary is not None:
+            plang = (primary.get("lang") or "und").lower()
+            if plang in ("ja", "jp"):
+                plang = "jpn"
+            slots.append({"src": primary, "filter": None, "stereo": False,
+                          "lang": plang,
+                          "native_stereo": False,
+                          "title": "%s %dch" % (
+                              "Japanese" if plang == "jpn" else "Original",
+                              primary.get("ch", 2) or 2)})
+            if "audio_foreign_primary_unboosted" not in plan["notes"]:
+                plan["notes"].append("audio_foreign_primary_unboosted_%s"
+                                     % plang)
     if not slots:
         slots = [{"src": plan["audio"], "filter": None, "stereo": False,
                   "lang": (plan["audio"].get("lang") or "und"),
+                  "native_stereo": False,
                   "title": ""}]
-    if extra:
-        # the dialogue-boosted mix that whisper transcribed, kept so it
-        # can be listened to as well as read
+    if extra and not slots:
+        # The dialogue-boosted mix whisper transcribed. Under the fixed
+        # layout a1 IS the boosted English track, so appending this as
+        # well would put the same processed audio in the file twice and
+        # make a fourth track the specification does not have. It is
+        # kept only as a last resort, when nothing else produced a slot.
         slots.append(extra)
+    elif extra:
+        plan["notes"].append("asr_mix_not_duplicated_a1_is_boosted")
 
     args = []
     auds_all = info.get("audios") or []
@@ -3862,11 +4251,29 @@ def acquire_subs(ctx, src, info, plan, log, tag):
         return [], None
     import av1_subs as SB
     t0 = time.time()
+    # extracted ASR audio and the language-check extractions are working
+    # material; they belong on scratch, not on the destination
+    work = scratch_dir(ctx)
     have = usable_subs(info)
+    # CHECK THE TEXT BEFORE TRUSTING THE TAG. Everything below decides
+    # what to generate from these two counts, and a track tagged English
+    # that is actually Japanese makes every one of those decisions wrong.
+    try:
+        n_fixed = verify_sub_languages(src, have, work, log)
+        if n_fixed:
+            log.info("    %d subtitle tag(s) corrected from their content"
+                     % n_fixed)
+    except Exception as e:
+        log.warning("    could not verify subtitle languages, falling back "
+                    "to their tags: %s: %s" % (type(e).__name__, e))
     have_eng = [s for s in have if s["lang"] in ("eng", "en")]
     have_jpn = [s for s in have if s["lang"] in ("jpn", "ja", "jp")]
     log.info("    subtitles present: %d English, %d Japanese"
              % (len(have_eng), len(have_jpn)))
+    for s in have:
+        log.debug("  sub #%d %s tag=%s detected=%s"
+                  % (s["idx"], s.get("codec"), s.get("lang"),
+                     s.get("lang_detected")))
     if have_eng and have_jpn:
         log.info("    both languages already present, nothing to generate")
         return [], None
@@ -3876,6 +4283,15 @@ def acquire_subs(ctx, src, info, plan, log, tag):
         log.warning("    no whisper model in %s, cannot generate subtitles"
                     % (WHISPER_MODEL_DIR or "(unset)"))
         return [], None
+    # Resolve untagged audio BEFORE anything decides what to generate.
+    # An untagged track is assumed English, and if that assumption is
+    # wrong it lands dialogue-boosted in slot 1 - the audio version of
+    # the mislabelled-subtitle fault above.
+    try:
+        verify_untagged_audio(src, info, work, model, log)
+    except Exception as e:
+        log.warning("    could not verify the audio language, keeping the "
+                    "English assumption: %s: %s" % (type(e).__name__, e))
     vad = SB.find_vad_model(WHISPER_MODEL_DIR) if WHISPER_VAD else None
     if vad:
         log.info("    voice detection on: %s (roughly 4x the "
@@ -3888,9 +4304,8 @@ def acquire_subs(ctx, src, info, plan, log, tag):
     made, extra_slot = [], None
     eng_srt = None
     jpn_srt = None
-    # extracted ASR audio is hundreds of megabytes a film and is read
-    # straight back by whisper; it has no business on the share
-    work = scratch_dir(ctx)
+    # `work` is set above, before the language check, because that check
+    # needs somewhere to extract to as well.
 
     # ---- English -----------------------------------------------------
     if not have_eng:
@@ -3960,8 +4375,48 @@ def acquire_subs(ctx, src, info, plan, log, tag):
                              "translation source")
                 break
         else:
-            log.info("    English subtitles are bitmap only, so they "
-                     "cannot be translated without OCR")
+            # BITMAP ENGLISH SUBTITLES ARE NOT A DEAD END.
+            #
+            # PGS and VobSub carry pictures of text, so they cannot be
+            # translated without OCR - but the film still has English
+            # AUDIO, and whisper turns that into text. Appleseed came
+            # out with no Japanese subtitles at all for exactly this
+            # reason: its English subs are bitmap, the code gave up
+            # here, and the Japanese slot had nothing to translate from.
+            #
+            # The transcript is used ONLY as a translation source. The
+            # existing bitmap track stays exactly where it is; nothing
+            # replaces subtitles the film already has.
+            log.info("    the English subtitles are bitmap, so they cannot "
+                     "be translated directly")
+            eng_aud = best_for_lang(info, ("eng", "en"))
+            if eng_aud is not None:
+                log.info("    transcribing the English audio instead, to "
+                         "translate the Japanese track from")
+                pexp = (pan_expr(eng_aud["layout"],
+                                 centre=SB.ENHANCE_CENTRE)
+                        if eng_aud.get("ch", 0) > 2 else None)
+                filt = compensate_af_latency(
+                    SB.enhance_filter(eng_aud.get("layout", ""),
+                                      pan_expr=pexp), log, "dialogue mix")
+                wav = work / ("%s.engocr.wav" % tag)
+                if SB.make_asr_wav(TOOLS["ffmpeg"], src, eng_aud["idx"],
+                                   filt, wav, log):
+                    out = work / ("%s.eng_asr.srt" % tag)
+                    got = SB.whisper_srt(TOOLS["ffmpeg"], wav, model, "en",
+                                         out, WHISPER_GPU, WHISPER_QUEUE,
+                                         log, vad_model=vad)
+                    cleanup_paths([wav])
+                    if got:
+                        tidy_generated_srt(got, info, log)
+                        eng_srt = got
+                        plan["notes"].append(
+                            "eng_transcribed_for_translation_source")
+                        log.info("    English transcript ready as a "
+                                 "translation source")
+            else:
+                log.info("    and there is no English audio to transcribe "
+                         "instead, so no Japanese track can be made")
 
     # ---- Japanese ----------------------------------------------------
     if not have_jpn:
@@ -4114,6 +4569,346 @@ def usable_subs(info, log=None):
             log.info("    dropped %d subtitle track(s) by language"
                      % len(dropped_lang))
     return out
+
+
+TEXT_SUB_CODECS = ("subrip", "ass", "ssa", "mov_text", "text", "webvtt")
+
+
+def verify_audio_language(src, track, work, model, log, seconds=60.0,
+                          dur=0.0):
+    """What language is this audio ACTUALLY in?
+
+    An untagged track is assumed to be English, which is right far more
+    often than not - but assuming it and being wrong puts a Japanese
+    track into slot 1 and dialogue-boosts it, which is the audio version
+    of the mislabelled-subtitle fault.
+
+    A minute is transcribed with whisper in auto-detect mode and the
+    resulting TEXT is run through the same script detector the subtitles
+    use. Whisper writes what it hears in the script of the language it
+    heard, so Japanese speech comes back in kana and English comes back
+    in Latin - which is exactly the distinction being asked for, and it
+    reuses machinery that is already proven rather than adding a second
+    language detector.
+
+    Sampled from the middle of the film: the first minute is often
+    silence, a logo sting or a foreign-language cold open.
+
+    Returns:
+        str: "jpn", "latin", or "unknown" when it cannot tell. The
+        caller keeps its assumption on "unknown" rather than acting on
+        a guess.
+    """
+    import av1_subs as SB
+    if not model:
+        return "unknown"
+    start = max(0.0, (dur * 0.4) if dur else 300.0)
+    wav = Path(work) / ("langcheck_a%d.wav" % track.get("idx", 0))
+    srt = Path(work) / ("langcheck_a%d.srt" % track.get("idx", 0))
+    try:
+        rc, _, err = run([TOOLS["ffmpeg"], "-hide_banner", "-y", "-v",
+                          "error", "-ss", "%.2f" % start,
+                          "-t", "%.2f" % seconds, "-i", str(src),
+                          "-map", "0:%d" % track["idx"], "-vn", "-sn",
+                          "-ac", "1", "-ar", "16000",
+                          "-c:a", "pcm_s16le", str(wav)], timeout=900)
+        if rc != 0 or not wav.exists():
+            log.debug("language check: could not extract audio: %s"
+                      % (err or "")[-200:])
+            return "unknown"
+        got = SB.whisper_srt(TOOLS["ffmpeg"], wav, model, "auto", srt,
+                             WHISPER_GPU, WHISPER_QUEUE, log)
+        if not got:
+            return "unknown"
+        return SB.srt_language(got)
+    except Exception as e:
+        log.debug("audio language check failed: %s" % e)
+        return "unknown"
+    finally:
+        cleanup_paths([wav, srt])
+
+
+def verify_untagged_audio(src, info, work, model, log):
+    """Resolve 'und' audio tracks to a real language before slotting.
+
+    Only runs where the answer changes something: a track with no usable
+    language tag that would otherwise be assumed English and land in
+    slot 1, boosted. A file whose tracks are all properly tagged costs
+    nothing here.
+
+    Returns:
+        int: how many tags were resolved.
+    """
+    auds = info.get("audios") or []
+    if not auds:
+        return 0
+    untagged = [a for a in auds
+                if (a.get("lang") or "und").lower() in ("und", "", "unk")]
+    if not untagged:
+        return 0
+    tagged_eng = any((a.get("lang") or "").lower() in ("eng", "en")
+                     for a in auds)
+    if tagged_eng:
+        # A properly tagged English track already exists, so the
+        # untagged ones are not going to be assumed English into slot 1.
+        return 0
+    fixed = 0
+    for a in untagged[:2]:
+        got = verify_audio_language(src, a, work, model, log,
+                                    dur=info.get("dur", 0.0))
+        if got == "jpn":
+            log.warning("    audio #%d has no language tag and was assumed "
+                        "English, but a transcription of it comes back in "
+                        "JAPANESE; tagging it jpn so it is not boosted "
+                        "into the primary slot" % a["idx"])
+            a["lang"] = "jpn"
+            fixed += 1
+        elif got == "latin":
+            log.info("    audio #%d has no language tag; a transcription "
+                     "reads as Latin script, so the English assumption "
+                     "stands" % a["idx"])
+            a["lang"] = "eng"
+            fixed += 1
+        else:
+            log.info("    audio #%d has no language tag and could not be "
+                     "identified; assuming English as specified"
+                     % a["idx"])
+    return fixed
+
+
+def verify_sub_languages(src, subs, work, log):
+    """Believe the TEXT, not the language tag.
+
+    A subtitle track's language tag is a claim made by whoever muxed the
+    file, and on a fansubbed release it is frequently wrong. Two films in
+    the 2026-08-13 batch carry a track tagged "eng" whose content is
+    Japanese. The pipeline believed the tag, counted the file as already
+    having English subtitles, skipped generating any, and shipped a film
+    whose English track nobody can read.
+
+    Each text-based track is extracted once and its script identified.
+    Where the content disagrees with the tag, THE CONTENT WINS and the
+    tag is corrected in place, so every later decision - what to
+    generate, what to translate from, and what language to write into
+    the finished file - is made against what the track actually is.
+
+    Bitmap subtitles (PGS, VobSub) cannot be read without OCR, so their
+    tags are left alone and said to be unverified. That is a real gap
+    and it is stated rather than papered over.
+
+    Args:
+        src: the source file.
+        subs: subtitle descriptors from probe_file, MUTATED in place.
+        work: scratch directory for the extractions.
+        log: logger.
+
+    Returns:
+        int: how many tags were corrected.
+    """
+    import av1_subs as SB
+    fixed = 0
+    for s in subs or []:
+        codec = (s.get("codec") or "").lower()
+        if codec not in TEXT_SUB_CODECS:
+            s["lang_detected"] = "unverified_bitmap"
+            continue
+        tmp = Path(work) / ("langcheck_%d.srt" % s["idx"])
+        try:
+            rc, _, err = run([TOOLS["ffmpeg"], "-hide_banner", "-y", "-v",
+                              "error", "-i", str(src),
+                              "-map", "0:%d" % s["idx"], "-c:s", "srt",
+                              str(tmp)], timeout=900)
+            if rc != 0 or not tmp.exists():
+                s["lang_detected"] = "unreadable"
+                log.debug("could not extract subtitle %d to check its "
+                          "language: %s" % (s["idx"], (err or "")[-200:]))
+                continue
+            got = SB.srt_language(tmp)
+        except Exception as e:
+            s["lang_detected"] = "unreadable"
+            log.debug("language check failed on subtitle %d: %s"
+                      % (s["idx"], e))
+            continue
+        finally:
+            cleanup_paths([tmp])
+        s["lang_detected"] = got
+        tag = (s.get("lang") or "und").lower()
+        if got in ("unknown", "unreadable"):
+            continue
+        tagged_eng = tag in ("eng", "en")
+        tagged_jpn = tag in ("jpn", "ja", "jp")
+        if got == "latin":
+            # Latin script does not prove ENGLISH - it would not tell
+            # English from French - so a Latin track tagged something
+            # Latin-scripted is left exactly as it is. Only the
+            # contradiction is acted on.
+            if tagged_jpn:
+                log.warning("    subtitle #%d is tagged Japanese but its "
+                            "text is in Latin script; re-tagging it English"
+                            % s["idx"])
+                s["lang"] = "eng"
+                fixed += 1
+            continue
+        if got == "jpn" and not tagged_jpn:
+            log.warning("    subtitle #%d is tagged '%s' but its text is "
+                        "JAPANESE; re-tagging it Japanese so it is not "
+                        "mistaken for an English track" % (s["idx"], tag))
+            s["lang"] = "jpn"
+            fixed += 1
+        elif got not in ("jpn",) and tagged_eng:
+            log.warning("    subtitle #%d is tagged English but its text "
+                        "reads as '%s'; re-tagging it" % (s["idx"], got))
+            s["lang"] = got
+            fixed += 1
+    return fixed
+
+
+SUB_CODEC_LABEL = {"hdmv_pgs_subtitle": "PGS", "pgssub": "PGS",
+                   "dvd_subtitle": "VobSub", "dvdsub": "VobSub",
+                   "ass": "ASS", "ssa": "ASS", "subrip": "SRT",
+                   "mov_text": "SRT", "text": "SRT", "webvtt": "VTT"}
+
+LANG_LABEL = {"eng": "English", "en": "English", "jpn": "Japanese",
+              "ja": "Japanese", "jp": "Japanese", "chi": "Chinese",
+              "kor": "Korean", "rus": "Russian", "ita": "Italian",
+              "fre": "French", "fra": "French", "ger": "German",
+              "deu": "German", "spa": "Spanish", "por": "Portuguese",
+              "und": "Undetermined"}
+
+
+def sub_track_names(subs):
+    """A distinct, meaningful name for every subtitle track.
+
+    Two English tracks in one file used to arrive in the output with no
+    names at all, so a player offered "English" twice with nothing to
+    choose between them. Fullmetal Alchemist is the case.
+
+    The source's own title wins when it has one - a fansub that says
+    "Signs & Songs" is more use than anything derivable. Otherwise a
+    name is built from the language and the disposition flags, and where
+    that still collides the format and an index are added, because two
+    tracks the file itself cannot tell apart still have to be
+    distinguishable in a menu.
+
+    Args:
+        subs: subtitle descriptors, in the order they will be muxed.
+
+    Returns:
+        dict: {stream index: name}
+    """
+    base = {}
+    for s in subs or []:
+        title = (s.get("title") or "").strip()
+        if title:
+            base[s["idx"]] = title
+            continue
+        lang = LANG_LABEL.get((s.get("lang") or "und").lower(),
+                              (s.get("lang") or "und").title())
+        if s.get("forced"):
+            base[s["idx"]] = "%s (Forced)" % lang
+        elif s.get("sdh"):
+            base[s["idx"]] = "%s (SDH)" % lang
+        else:
+            base[s["idx"]] = lang
+    # Disambiguate whatever still collides.
+    counts = {}
+    for idx, name in base.items():
+        counts[name] = counts.get(name, 0) + 1
+    seen = {}
+    out = {}
+    for s in subs or []:
+        idx = s["idx"]
+        name = base[idx]
+        if counts.get(name, 0) > 1:
+            seen[name] = seen.get(name, 0) + 1
+            fmt = SUB_CODEC_LABEL.get((s.get("codec") or "").lower(), "")
+            if fmt:
+                name = "%s (%s %d)" % (name, fmt, seen[name])
+            else:
+                name = "%s %d" % (name, seen[name])
+        out[idx] = name
+    return out
+
+
+def has_english_audio(info):
+    """Does this file carry English audio at all?
+
+    Decides whether the viewer will be READING the film. If they are,
+    English subtitles belong in slot 1 turned on; if they are not, slot
+    1 is the blank track and subtitles start off.
+    """
+    for a in info.get("audios") or []:
+        if (a.get("lang") or "").lower() in ("eng", "en"):
+            return True
+    return False
+
+
+def plan_subtitle_slots(info, generated, log=None):
+    """Order the subtitle tracks exactly as specified.
+
+        s1  Forced English if forced English subs exist;
+            else full English when the film has NO English audio;
+            else the blank "Off" track.
+        s2  English. Skipped when s1 already holds the full English
+            track, so English is never carried twice.
+        s3  Japanese.
+
+    Slot 1 is the one a player lands on, which is why its contents
+    depend on whether the viewer needs subtitles to follow the film at
+    all. A forced track wins it outright: forced subtitles exist to
+    translate signs and foreign lines inside an otherwise-English film,
+    and that is precisely what should be on by default.
+
+    Args:
+        info: probe result, for the source subtitle list and the audio.
+        generated: descriptors for subtitles this run produced, each a
+            dict of path/lang/title.
+        log: optional logger.
+
+    Returns:
+        dict: {"slot1": ..., "slot2": ..., "slot3": ..., "rest": [...]}
+        where each slot is either None, the string "blank", a source
+        subtitle dict, or a generated descriptor.
+    """
+    src_subs = usable_subs(info)
+    eng_src = [s for s in src_subs if (s.get("lang") or "") in ("eng", "en")]
+    jpn_src = [s for s in src_subs
+               if (s.get("lang") or "") in ("jpn", "ja", "jp")]
+    forced_eng = [s for s in eng_src if s.get("forced")]
+    full_eng = [s for s in eng_src if not s.get("forced")]
+    gen_eng = [g for g in (generated or []) if g.get("lang") == "eng"]
+    gen_jpn = [g for g in (generated or []) if g.get("lang") == "jpn"]
+
+    english = full_eng[0] if full_eng else (gen_eng[0] if gen_eng else None)
+    japanese = jpn_src[0] if jpn_src else (gen_jpn[0] if gen_jpn else None)
+
+    slot1 = "blank"
+    slot2 = english
+    if forced_eng:
+        slot1 = forced_eng[0]
+    elif not has_english_audio(info) and english is not None:
+        # The viewer cannot follow this film without reading it, so the
+        # English track is what a player should open on.
+        slot1 = english
+        slot2 = None          # never carry English twice
+    slot3 = japanese
+
+    used = [x for x in (slot1, slot2, slot3)
+            if x is not None and x != "blank"]
+    rest = [s for s in src_subs if s not in used]
+    if log:
+        def name(x):
+            if x is None:
+                return "-"
+            if x == "blank":
+                return "blank (Off)"
+            if "path" in x:
+                return "generated %s" % x.get("lang")
+            return "source #%d %s%s" % (x["idx"], x.get("lang"),
+                                        " forced" if x.get("forced") else "")
+        log.info("    subtitle slots: 1=%s  2=%s  3=%s"
+                 % (name(slot1), name(slot2), name(slot3)))
+    return {"slot1": slot1, "slot2": slot2, "slot3": slot3, "rest": rest}
 
 
 def blank_sub_path(tmp):
@@ -4312,6 +5107,7 @@ def mkvmerge_assemble(va_path, src_path, info, out_path, ext_subs=None,
     if keep and not chosen:
         log.warning("      mkvmerge could not match any subtitle track; "
                     "carrying on without the source subtitles")
+    sub_names = sub_track_names([s for s, _t in chosen])
 
     # which track ends up flagged default, mirroring the ffmpeg path
     eng_src_tid = None
@@ -4356,6 +5152,20 @@ def mkvmerge_assemble(va_path, src_path, info, out_path, ext_subs=None,
         for _s, tid in chosen:
             cmd += ["--default-track-flag",
                     "%d:%d" % (tid, 1 if tid == eng_src_tid else 0)]
+            # State the language explicitly rather than letting the
+            # source's own tag through. verify_sub_languages() may have
+            # CORRECTED it by reading the text - a track tagged English
+            # whose content is Japanese gets re-tagged - and without
+            # this that correction would be worked out, logged, acted
+            # on for the generation decision, and then thrown away at
+            # the muxer, leaving the finished file mislabelled anyway.
+            lang = (_s.get("lang") or "und").lower()
+            cmd += ["--language", "%d:%s" % (tid, lang)]
+            # Name it too. Without this two English tracks arrive as two
+            # identical menu entries.
+            nm = sub_names.get(_s["idx"])
+            if nm:
+                cmd += ["--track-name", "%d:%s" % (tid, nm)]
         cmd += [str(src_path)]
         order += [(fid, t) for _s, t in chosen]
     else:
@@ -4371,6 +5181,52 @@ def mkvmerge_assemble(va_path, src_path, info, out_path, ext_subs=None,
                 "--forced-display-flag", "0:0", str(e["path"])]
         order.append((fid, 0))
         fid += 1
+
+    # ---- impose the specified subtitle order -------------------------
+    # The files are already on the command line and their ids are fixed
+    # by that order; --track-order is what decides the layout in the
+    # finished file. `order` was built in the order the inputs were
+    # added - blank, then the source tracks, then the generated ones -
+    # which is not the order the specification asks for.
+    #
+    #   s1  Forced English, else full English when there is no English
+    #       audio, else the blank "Off" track
+    #   s2  English (skipped when s1 already holds it)
+    #   s3  Japanese
+    #
+    # The entries are paired back to the objects they came from and
+    # re-sorted. Anything not named by a slot keeps its relative order
+    # after the three, so nothing is ever dropped by this step.
+    try:
+        n_va = len(va_ids)
+        head, subs_part = order[:n_va], order[n_va:]
+        objs = (["blank"] if blank_srt else []) \
+            + [s for s, _t in chosen] + list(ext_subs)
+        if len(objs) == len(subs_part):
+            slots = plan_subtitle_slots(info, ext_subs, log)
+            wanted = [slots["slot1"], slots["slot2"], slots["slot3"]]
+            rank = {}
+            for pos, want in enumerate(wanted):
+                if want is None:
+                    continue
+                for n, o in enumerate(objs):
+                    if o is want or (want == "blank" and o == "blank"):
+                        rank[n] = pos
+                        break
+            # the blank track, when a real track won slot 1, sits after
+            # the named slots rather than being dropped: an empty "Off"
+            # entry is harmless and removing an input at this stage
+            # would renumber everything above it
+            paired = list(zip(objs, subs_part))
+            ordered = sorted(range(len(paired)),
+                             key=lambda n: (rank.get(n, 90 + n), n))
+            order = head + [paired[n][1] for n in ordered]
+        else:
+            log.debug("subtitle slot mapping skipped: %d objects against "
+                      "%d order entries" % (len(objs), len(subs_part)))
+    except Exception as e:
+        log.warning("      could not impose the subtitle order (%s: %s); "
+                    "using the input order" % (type(e).__name__, e))
 
     if order:
         cmd += ["--track-order",
@@ -4634,6 +5490,149 @@ def sr_tile_for(scale, max_dim, log=None):
     return tile
 
 
+def sr_backend(log=None):
+    """Which upscaler to use: "cuda", "ncnn", or "" for none.
+
+    THE SWITCH FROM VULKAN TO CUDA, and why it exists.
+
+    realesrgan-ncnn-vulkan.exe on this machine is dated 2022-04-24 -
+    about three years older than the Blackwell silicon it runs on.
+    Blackwell requires 64 KB resource alignment where earlier
+    architectures accepted 4 KB, and a mismatch produces a GPU LOCKUP
+    rather than a clean error. That matches the freezes exactly: no
+    Display 4101 (so not a driver timeout), no bugcheck, no minidump,
+    an nvlddmkm Event 153 storm, and a card reading cold because it is
+    stuck rather than working. Every one of the ten resets on
+    2026-08-16 fell inside a Real-ESRGAN compute window.
+
+    MEASURED on 120 real frames, 640x352 -> 2560x1408, tile 640:
+
+        ncnn / Vulkan   19.8 s    6.07 fps   4.2 GB budgeted
+        CUDA            6.1 s    19.56 fps   2.1 GB peak
+                        -> 2.94x faster, half the memory
+        output difference: 52.9 dB PSNR, 0.03 pct mean absolute
+        -> fp16 rounding, visually identical
+
+    ncnn is NOT removed. It is the fallback, and it remains the only
+    option on machines with no CUDA - AMD, Intel, and Apple Silicon
+    through MoltenVK, which is what the macOS port uses.
+
+    Probed once and cached. The probe imports torch and asks for a real
+    device, because "torch is installed" and "CUDA works on this card"
+    are different claims and this project has been caught by that
+    distinction before.
+    """
+    if "sr_backend" in CAPS:
+        return CAPS["sr_backend"]
+    log = log or globals()["log"]
+    want = (SR_BACKEND or "auto").strip().lower()
+    if want == "off":
+        CAPS["sr_backend"] = ""
+        return ""
+    chosen = ""
+    detail = ""
+    if want in ("auto", "cuda"):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                cap = torch.cuda.get_device_capability(0)
+                name = torch.cuda.get_device_name(0)
+                arch = torch.cuda.get_arch_list()
+                # A torch built without kernels for this card reports
+                # cuda available and then fails at the first launch.
+                sm = "sm_%d%d" % cap
+                if sm in arch or want == "cuda":
+                    chosen = "cuda"
+                    detail = ("%s %s, torch %s / CUDA %s"
+                              % (name, sm, torch.__version__,
+                                 torch.version.cuda))
+                else:
+                    detail = ("torch has no kernels for %s (has %s)"
+                              % (sm, ",".join(arch)))
+            else:
+                detail = "torch present but CUDA not available"
+        except ImportError:
+            detail = "torch is not installed"
+        except Exception as e:
+            detail = "%s: %s" % (type(e).__name__, e)
+    if chosen != "cuda" and want in ("auto", "ncnn"):
+        if TOOLS.get("realesrgan"):
+            chosen = "ncnn"
+            if want == "auto" and detail:
+                log.warning("    upscaler: falling back to ncnn/Vulkan "
+                            "because %s" % detail)
+                log.warning("    NOTE: the ncnn binary predates Blackwell "
+                            "and is what the 2026-08-16 GPU lockups were "
+                            "traced to. On an RTX 50 card, install a CUDA "
+                            "torch instead.")
+        elif want == "ncnn":
+            log.warning("    sr_backend=ncnn but realesrgan-ncnn-vulkan "
+                        "is not installed")
+    CAPS["sr_backend"] = chosen
+    CAPS["sr_backend_detail"] = detail
+    if chosen == "cuda":
+        log.info("    upscaler: CUDA (%s)" % detail)
+    elif chosen == "ncnn":
+        log.info("    upscaler: ncnn/Vulkan (%s)"
+                 % (TOOLS.get("realesrgan") or "?"))
+    else:
+        log.info("    upscaler: none available; upscales use lanczos")
+    return chosen
+
+
+def sr_model_present(model):
+    """Is the upscaler's model actually on disk?
+
+    The exe existing does NOT mean the models do. They are shipped
+    separately: the Real-ESRGAN-ncnn-vulkan repo's own release zips
+    contain the executable and nothing else, and only the bundle
+    published by the main Real-ESRGAN repo carries the weights.
+
+    Without this the exe is found, the upscale path is chosen, the
+    model load fails inside the tool, sr_encode raises and the FILE IS
+    FAILED - so on a machine where the models were never installed,
+    every source under 1080 lines fails instead of quietly taking the
+    lanczos path that exists for exactly this case.
+
+    Args:
+        model: model name as passed to realesrgan-ncnn-vulkan, e.g.
+            realesr-animevideov3.
+
+    Returns:
+        bool: True when at least one scale of that model is present.
+        The scale is chosen later, and the model directory holds one
+        .param per factor.
+    """
+    cache = CAPS.setdefault("sr_models_present", {})
+    if model in cache:
+        return cache[model]
+    ok = False
+    backend = sr_backend()
+    if backend == "cuda":
+        # The CUDA backend downloads its .pth on first use, so a model
+        # it knows a URL for counts as present. Only an unknown name is
+        # missing.
+        try:
+            import av1_upscale_cuda as UC
+            d = Path(__file__).resolve().parent / "models_cuda"
+            ok = ((d / (model + ".pth")).exists()
+                  or model in UC.MODEL_URLS)
+        except Exception:
+            ok = False
+    elif backend == "ncnn":
+        exe = TOOLS.get("realesrgan")
+        if exe:
+            try:
+                d = Path(exe).parent / "models"
+                if d.is_dir():
+                    ok = (any(d.glob(model + "-x*.param"))
+                          or (d / (model + ".param")).exists())
+            except OSError:
+                ok = False
+    cache[model] = ok
+    return ok
+
+
 _SCALE_WARNED = set()
 
 
@@ -4702,6 +5701,121 @@ def pick_sr_scale(ch, model, want=None):
     return avail[-1]
 
 
+class SrServer:
+    """A resident av1_upscale_cuda.py taking one job per chunk.
+
+    Launching the upscaler per chunk cost 3.2 s of a 36.3 s chunk on this
+    machine - torch's import, a fresh CUDA context, and cudnn's autotuning
+    thrown away each time - which over the 447 chunks of one film is
+    around 24 minutes spent loading the same library. It also created and
+    destroyed a CUDA context 447 times per film, which is the operation
+    most likely to upset a display driver on a card this new.
+
+    The model, the context and the autotuning now live for the whole
+    file. Jobs go in as "indir<TAB>outdir" and one JSON metrics line
+    comes back per job.
+
+    The tile size is fixed for the life of the process, so the step-down
+    ladder restarts it. That is rare - a chunk peaks at 13 pct of this
+    board - and a restart costs one torch import, not a file.
+    """
+
+    def __init__(self, script, model, scale, tile, vram_pct, cpu_threads,
+                 io_threads, log, out_wh=None):
+        self.script = str(script)
+        self.model = model
+        self.scale = int(scale)
+        self.out_wh = out_wh
+        self.tile = int(tile or 0)
+        self.vram_pct = vram_pct
+        self.cpu_threads = int(cpu_threads or 0)
+        self.io_threads = int(io_threads or 0)
+        self.log = log
+        self.proc = None
+        self.hello = {}
+
+    def _cmd(self):
+        cmd = [sys.executable, self.script, "--serve",
+               "-n", self.model, "-s", str(self.scale), "-f", "png",
+               "--vram-pct", str(self.vram_pct)]
+        if self.out_wh:
+            cmd += ["--out-w", str(self.out_wh[0]),
+                    "--out-h", str(self.out_wh[1])]
+        if self.tile:
+            cmd += ["-t", str(self.tile)]
+        if self.cpu_threads:
+            cmd += ["--cpu-threads", str(self.cpu_threads)]
+        if self.io_threads:
+            cmd += ["--io-threads", str(self.io_threads)]
+        return cmd
+
+    def start(self):
+        """Spawn it and wait for its ready line. Returns True on success."""
+        self.proc = subprocess.Popen(
+            self._cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+            creationflags=NOWIN)
+        line = self.proc.stdout.readline()
+        if not line:
+            err = ""
+            try:
+                err = (self.proc.stderr.read() or "")[-400:]
+            except Exception:
+                pass
+            self.log.warning("    the upscaler would not start in resident "
+                             "mode; falling back to one process per chunk. "
+                             "%s" % err.strip())
+            self.stop()
+            return False
+        try:
+            self.hello = json.loads(line)
+        except ValueError:
+            self.hello = {}
+        return True
+
+    def run(self, indir, outdir):
+        """One chunk. Returns (metrics, error). Never raises for a job."""
+        if self.proc is None or self.proc.poll() is not None:
+            return None, "the upscaler is not running"
+        try:
+            self.proc.stdin.write("%s\t%s\n" % (indir, outdir))
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        except OSError as e:
+            return None, "could not talk to the upscaler: %s" % e
+        if not line:
+            return None, "the upscaler stopped without answering"
+        try:
+            m = json.loads(line)
+        except ValueError:
+            return None, "unreadable answer: %s" % line[:200]
+        if m.get("error"):
+            return None, m["error"]
+        return m, ""
+
+    def restart(self, tile):
+        self.stop()
+        self.tile = int(tile or 0)
+        return self.start()
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p is None:
+            return
+        try:
+            if p.stdin and not p.stdin.closed:
+                p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=20)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------
 # Real-ESRGAN upscale path: frames out, model pass, chunk encode,
 # concat, then one mux pulling audio, subs, and chapters off the
@@ -4759,6 +5873,10 @@ def sr_encode(ctx, enc_input, info, an, plan, tmp_out, log, tag,
     scale = pick_sr_scale(ch, model)
     fps_str = info.get("fps_str") or ("%.6f" % info["fps"])
     enc = pick_encoder(True)
+    sr_be = sr_backend(log)
+    if not sr_be:
+        raise RuntimeError("no upscaler backend available")
+    plan["notes"].append("sr_backend_" + sr_be)
     # the frame folders take thousands of PNG writes per chunk. keeping
     # them on fast local storage instead of a network share is the
     # single biggest speed lever in this whole path
@@ -4780,17 +5898,60 @@ def sr_encode(ctx, enc_input, info, an, plan, tmp_out, log, tag,
     # docstring has always claimed the scratch stays off the share; only
     # half of it did.
     parts_root = scratch / (tag + ".sr.parts")
-    f_in, f_out, parts = work / "in", work / "out", parts_root / "parts"
+    # The frame directories are per-slot now, created below where the
+    # slots are - three of each, so extract, model and encode can work on
+    # different chunks at the same time without sharing a folder.
+    parts = parts_root / "parts"
     shutil.rmtree(work, ignore_errors=True)
     shutil.rmtree(parts_root, ignore_errors=True)
-    for d in (f_in, f_out, parts):
-        d.mkdir(parents=True, exist_ok=True)
-    tile0 = sr_tile_for(scale, max(cw, ch), log)
+    parts.mkdir(parents=True, exist_ok=True)
+    # THE SCALE THE MODEL ACTUALLY RUNS AT.
+    #
+    # Every CUDA model here is a x4 network - the PyTorch release of
+    # animevideov3 ships x4 weights only - so it allocates x4 tensors
+    # whatever factor was asked for. Sizing the tile and the video memory
+    # reserve from the REQUESTED factor therefore under-estimates: asking
+    # for x2 budgeted 1300 MB per 400px of tile while the model was doing
+    # x4 work. It happened to be safe at 640x352 (3328 MB budgeted
+    # against 2125 MB actually used) but that is luck, not design, and
+    # this is the one place where being wrong resets the display driver.
+    #
+    # ncnn is different: it has real x2 and x3 weight files, so there the
+    # requested factor is the factor.
+    run_scale = SR_CUDA_NATIVE_SCALE if sr_be == "cuda" else scale
+    tile0 = sr_tile_for(run_scale, max(cw, ch), log)
     # halve on each retry, ending at the tool's own auto so there is
     # always a rung that works
     sr_tiles = [tile0, max(64, tile0 // 2), max(64, tile0 // 4), 0]
+    # ONE REDUCTION, STRAIGHT TO THE TARGET.
+    #
+    # The chain used to be: model x4 -> reduce to x2 -> PNG -> ffmpeg
+    # lanczos back UP to 1080. On a 352-line source x2 is 704 lines, so
+    # 704 lines of real model output were discarded and then interpolated
+    # back. MEASURED on 20 real frames, mean absolute laplacian as a
+    # proxy for retained detail: plain lanczos upscale 0.515, that route
+    # 0.740, one reduction straight to 1080 1.021, model native x4 1.275.
+    # The old route threw away 38 pct of what the model produced.
+    #
+    # So on CUDA the model output is reduced once, on the GPU, to exactly
+    # the size the plan asked for, and SCALE_1080 comes out of the filter
+    # chain because there is nothing left for it to do. Only when the
+    # target is BIGGER than the model's native output does the chain keep
+    # its scaler, since something still has to cover the difference.
+    sr_out_wh = None
+    tgt_w = int(plan.get("out_w") or 0)
+    tgt_h = int(plan.get("out_h") or 0)
+    nat_w, nat_h = cw * SR_CUDA_NATIVE_SCALE, ch * SR_CUDA_NATIVE_SCALE
+    if sr_be == "cuda" and tgt_w > 0 and tgt_h > 0 and tgt_h <= nat_h:
+        sr_out_wh = (tgt_w - (tgt_w % 2), tgt_h - (tgt_h % 2))
+    png_w, png_h = sr_out_wh if sr_out_wh else (cw * scale, ch * scale)
     log.info("    sr x%d, threads %s, scratch %s"
              % (scale, SR_THREADS, scratch))
+    if sr_out_wh:
+        log.info("    sr scale chain: %dx%d -> model x%d -> %dx%d -> one "
+                 "reduction to %dx%d, no second scaler"
+                 % (cw, ch, SR_CUDA_NATIVE_SCALE, nat_w, nat_h,
+                    png_w, png_h))
     log.debug("sr scratch=%s parts=%s encoder=%s" % (work, parts, enc))
     pre = []
     if an["interlaced"]:
@@ -4818,21 +5979,32 @@ def sr_encode(ctx, enc_input, info, an, plan, tmp_out, log, tag,
     # crispness comes back through a contrast adaptive sharpen instead.
     # Same filter the no-rescale path already uses at exactly 1080.
     sharpen = ""
-    over = (ch * scale) / 1080.0
+    # The oversampling ratio must come from the factor the model really
+    # computes at, not the one requested - on CUDA those differ, and it is
+    # the real one that decides whether the reduction is doing the
+    # sharpening for us.
+    over = (ch * run_scale) / float(tgt_h or 1080)
     if CAS_STRENGTH > 0 and over < 1.15:
         sharpen = "cas=strength=%.2f," % CAS_STRENGTH
         plan["notes"].append("sr_cas_sharpen_%.2f" % CAS_STRENGTH)
-    tail = stab + sharpen + SCALE_1080 + ",format=" + pix
+    # Nothing left to scale when the frames already arrive at the target.
+    if sr_out_wh and png_h == (tgt_h or 1080):
+        tail = stab + sharpen + "format=" + pix
+        plan["notes"].append("sr_single_reduction_%dx%d" % (png_w, png_h))
+    else:
+        tail = stab + sharpen + SCALE_1080 + ",format=" + pix
     strength = max(0, min(100, SR_STRENGTH))
     blend = strength < 100
     if blend:
         # input 0 is the model output, input 1 the plain lanczos upscale
         # of the very same source frames. all_opacity weights input 0,
-        # so it reads straight across as the AI strength
+        # so it reads straight across as the AI strength.
+        # The two legs MUST be the same size or blend refuses; the lanczos
+        # leg therefore follows whatever size the model output lands at.
         fc = ("[1:v]scale=%d:%d:flags=lanczos,format=rgb24[lz];"
               "[0:v]format=rgb24[sr];"
               "[sr][lz]blend=all_mode=normal:all_opacity=%.3f[bl];"
-              "[bl]%s[v]" % (cw * scale, ch * scale, strength / 100.0, tail))
+              "[bl]%s[v]" % (png_w, png_h, strength / 100.0, tail))
         log.info("    sr strength %d%%%s, encoder %s"
                  % (strength, ", temporal stabiliser on" if SR_STABILISE
                     else "", enc))
@@ -4847,134 +6019,441 @@ def sr_encode(ctx, enc_input, info, an, plan, tmp_out, log, tag,
     sr_ticks = 0
     log.info("    sr: %d chunks of %.0f s to do" % (n_chunks, SR_CHUNK_SEC))
     try:
-        for i in range(n_chunks):
-            start = i * SR_CHUNK_SEC
-            seg = min(SR_CHUNK_SEC, info["dur"] - start)
-            if seg <= 0.05:
-                break
-            t_chunk = time.time()
-            for d in (f_in, f_out):
-                for f in d.glob("*.png"):
-                    f.unlink()
+        # CHUNK BY FRAME COUNT, NOT BY DURATION.
+        #
+        # `-t 10` selects frames by TIME, and ten seconds is not a whole
+        # number of frames at any NTSC-fractional rate: 23.976 fps gives
+        # 239.76 frames and ffmpeg emits 240, 29.97 gives 299.7 and it
+        # emits 300. Every chunk therefore rounds UP, gaining the
+        # remainder, and over several hundred chunks that accumulates
+        # into seconds of extra picture.
+        #
+        # MEASURED on the four files that failed on 2026-08-16:
+        #   23.976 fps  +0.242 frames/chunk  ->  +108 and +112 frames
+        #   29.970 fps  +0.302 frames/chunk  ->  +135 frames
+        # which is exactly (1 - fractional part) each time, and
+        # 112/23.976 = 4.67 s - precisely the drift that failed them.
+        #
+        # -frames:v bounds each chunk to an exact count, and the start
+        # is derived from the cumulative frame position rather than from
+        # a multiple of ten seconds, so no boundary can round twice.
+        fps_exact = float(info.get("fps") or 24.0)
+        per_chunk = max(1, int(round(SR_CHUNK_SEC * fps_exact)))
+        # COUNT the source's frames rather than computing them. The
+        # output's length is decided entirely by how many frames come
+        # out of here, and the audio is on the master's own timeline, so
+        # a few frames either way is permanent sync drift.
+        counted = probe_video_frames(enc_input, info["dur"], fps_exact)
+        estimated = int(round(info["dur"] * fps_exact))
+        if counted > 0:
+            expect_frames = counted
+            if abs(counted - estimated) > 1:
+                log.info("    source has %d frames; %.3f s at %.6f fps "
+                         "would have predicted %d. Using the count."
+                         % (counted, info["dur"], fps_exact, estimated))
+        else:
+            expect_frames = estimated
+            log.warning("    could not count the source's frames; falling "
+                        "back to %d from duration x rate. If the finished "
+                        "length is off, this is why." % estimated)
+        log.info("    sr timeline: %d frames at %.6f fps = %.3f s, in "
+                 "chunks of %d frames"
+                 % (expect_frames, fps_exact, expect_frames / fps_exact,
+                    per_chunk))
+        # Per-chunk telemetry from the CUDA backend lands here and is
+        # read back after every chunk. Recorded so a future slowdown or
+        # failure can be diagnosed from the log alone rather than by
+        # reproducing it: backend, device, precision, tile, model
+        # throughput against wall throughput, and peak video memory.
+        sr_metrics_path = work / "sr_metrics.json"
+        sr_stats = {"model_s": 0.0, "frames": 0, "peak_vram_mb": 0.0,
+                    "io_s": 0.0, "wait_x": 0.0, "wait_e": 0.0}
+        # RUN THE THREE STAGES AT THE SAME TIME.
+        #
+        # A chunk is extract (ffmpeg, CPU) then model (CUDA cores) then
+        # encode (NVENC, a separate hardware block from the CUDA cores).
+        # Run strictly in turn, each unit idles while the other two work.
+        # MEASURED per 300-frame chunk before this change: extract 1.0 s,
+        # model 7.2 s, encode 4.6 s, and the log's own line for the whole
+        # phase read "3368.3 s of that was model inference (20% of wall)".
+        # NVENC in particular was recorded as idle throughout the upscale.
+        #
+        # So: extract for chunk i+1 and encode for chunk i-1 both run
+        # while the model works on chunk i. Three slot directories, used
+        # round-robin, keep them off each other's files - the encode needs
+        # BOTH the model's output and (when blending) the extracted input
+        # for the same chunk, so a slot cannot be recycled until its
+        # encode has finished. With one encode in flight at a time, slot
+        # i+1 is only ever cleared after the encode of i-2 has been
+        # collected.
+        #
+        # The model itself stays strictly one chunk at a time. It is the
+        # part that is genuinely GPU-bound, and overlapping two of them
+        # would only make each slower while raising peak video memory.
+        SLOTS = 3
+        slot_in = [work / ("in%d" % s) for s in range(SLOTS)]
+        slot_out = [work / ("out%d" % s) for s in range(SLOTS)]
+        for d in slot_in + slot_out:
+            d.mkdir(parents=True, exist_ok=True)
+
+        def chunk_span(i):
+            """Frames wanted for chunk i, and where it starts. 0 = stop."""
+            start_frame = i * per_chunk
+            want = per_chunk
+            if expect_frames > 0:
+                want = min(per_chunk, expect_frames - start_frame)
+            if want <= 0:
+                return 0, 0.0
+            start = start_frame / fps_exact
+            if min(SR_CHUNK_SEC, info["dur"] - start) <= 0.05:
+                return 0, 0.0
+            return want, start
+
+        def do_extract(i):
+            """Frames for chunk i into its slot. Off the main thread.
+
+            Returns (frames, seconds). The frame accounting - padding a
+            short chunk with a duplicate, dropping any surplus - happens
+            here so it stays attached to the extraction that caused it.
+            """
+            want, start = chunk_span(i)
+            if want <= 0:
+                return 0, 0.0
+            d = slot_in[i % SLOTS]
+            t_e = time.time()
+            for f in d.glob("*.png"):
+                f.unlink()
             rc, _, err = run([TOOLS["ffmpeg"], "-hide_banner", "-nostdin",
                               "-y", "-v", "error",
-                              "-ss", "%.3f" % start, "-t", "%.3f" % seg,
+                              "-ss", "%.6f" % start,
                               "-i", str(enc_input),
                               "-map", "0:%d" % info["vidx"],
+                              "-frames:v", str(want),
                               "-vf", ",".join(pre),
-                              str(f_in / "f%08d.png")], timeout=3600)
+                              str(d / "f%08d.png")], timeout=3600)
             if rc != 0:
                 raise RuntimeError("frame extract failed chunk %d: %s"
                                    % (i, err[-300:]))
-            t_extract = time.time() - t_chunk
-            n_frames = len(list(f_in.glob("*.png")))
-            if n_frames == 0:
-                if i == 0:
-                    raise RuntimeError("no frames came out of the source")
-                break
-            total_frames += n_frames
-            # tile as large as the card will take, stepping down only if
-            # it will not fit. an out of memory refusal here used to end
-            # the whole file; now it costs one retry.
-            got = 0
-            rc, out, err = -1, "", ""
-            for t_try in sr_tiles:
-                # Look before allocating. The step-down ladder below only
-                # helps when the tool exits cleanly with an error; when
-                # the card is genuinely full the driver resets instead,
-                # which is not a return code, it is the display going
-                # away. So wait for room first, and drop to a smaller
-                # tile if it never appears.
-                # heat first, then memory. Both are refusals to add load
-                # to a card that is already at a limit.
-                gpu_wait_for_cool(log)
-                need = SR_TILE_COST_400.get(scale, 1690.0) * \
-                    ((t_try or 400) / 400.0) ** 2
-                if not gpu_wait_for_headroom(need, log):
-                    rc, out, err = 125, "", "insufficient gpu headroom"
-                    if t_try != sr_tiles[-1]:
-                        log.warning("    not enough video memory for tile "
-                                    "%s; trying a smaller one"
-                                    % (t_try or "auto"))
-                    continue
-                srcmd = [TOOLS["realesrgan"], "-i", str(f_in),
-                         "-o", str(f_out), "-n", model,
-                         "-s", str(scale), "-f", "png"]
-                if t_try:
-                    srcmd += ["-t", str(t_try)]
-                if SR_THREADS:
-                    srcmd += ["-j", SR_THREADS]
-                rc, out, err = run(srcmd, timeout=7200)
-                got = len(list(f_out.glob("*.png")))
-                if rc == 0 and got == n_frames:
-                    if t_try != sr_tiles[0]:
-                        log.warning("    tile %s did not fit; settled at "
-                                    "%s for the rest of this file"
-                                    % (sr_tiles[0], t_try or "auto"))
-                        sr_tiles = [t_try]
-                    break
-                for f in f_out.glob("*.png"):
-                    f.unlink()
-                if t_try != sr_tiles[-1]:
-                    log.debug("sr tile %s failed rc=%s, stepping down"
-                              % (t_try, rc))
-            if rc != 0 or got != n_frames:
-                raise RuntimeError("realesrgan failed chunk %d rc %s "
-                                   "(%d of %d frames): %s"
-                                   % (i, rc, got, n_frames,
-                                      (err or out)[-300:]))
-            t_model = time.time() - t_chunk - t_extract
+            got_png = sorted(d.glob("*.png"))
+            n = len(got_png)
+            if n == 0:
+                return 0, time.time() - t_e
+            # A CHUNK MUST BE EXACTLY THE LENGTH IT WAS ASKED FOR.
+            #
+            # If extraction comes up short - a torn GOP, a seek landing
+            # awkwardly, a source that lies about its length - then
+            # every chunk after this one starts late and the picture
+            # slides against the audio for the rest of the film. The
+            # timeline matters more than the missing frame does, so the
+            # last frame is DUPLICATED to fill the gap. A repeated frame
+            # is invisible at 24 fps; a progressive sync slip is not.
+            if n < want:
+                short = want - n
+                last = got_png[-1]
+                for k in range(short):
+                    dup = d / ("f%08d.png" % (n + k + 1))
+                    try:
+                        shutil.copyfile(str(last), str(dup))
+                    except OSError as e:
+                        raise RuntimeError(
+                            "chunk %d came up %d frame(s) short and the "
+                            "gap could not be filled: %s" % (i, short, e))
+                log.warning("    chunk %d extracted %d of %d frames; "
+                            "duplicated the last frame %d time(s) to hold "
+                            "the timeline" % (i, n, want, short))
+                plan["notes"].append("sr_chunk%d_padded_%d" % (i, short))
+                n = want
+            elif n > want:
+                # -frames:v should make this impossible; if it happens,
+                # drop the surplus rather than let the film grow.
+                for extra in got_png[want:]:
+                    try:
+                        extra.unlink()
+                    except OSError:
+                        pass
+                log.warning("    chunk %d produced %d frames for %d asked; "
+                            "dropped the surplus" % (i, n, want))
+                n = want
+            return n, time.time() - t_e
+
+        def do_encode(i, n_frames):
+            """Encode chunk i from its slot. Off the main thread."""
+            f_i, f_o = slot_in[i % SLOTS], slot_out[i % SLOTS]
             part = parts / ("p%05d.mkv" % i)
             cmd = [TOOLS["ffmpeg"], "-hide_banner", "-nostdin", "-y",
                    "-v", "error", "-framerate", fps_str,
                    "-start_number", "1",
-                   "-i", str(f_out / "f%08d.png")]
+                   "-i", str(f_o / "f%08d.png")]
             if blend:
                 cmd += ["-framerate", fps_str, "-start_number", "1",
-                        "-i", str(f_in / "f%08d.png"),
+                        "-i", str(f_i / "f%08d.png"),
                         "-filter_complex", fc, "-map", "[v]"]
             else:
                 cmd += ["-vf", tail]
             cmd += enc_args(plan["cq"], plan["out_space"], False, enc,
                             plan.get("maxrate_kbps", 0))
             cmd += ["-f", "matroska", str(part)]
+            t_e = time.time()
             rc, _, err = run(cmd, timeout=7200)
             if rc != 0 or not part.exists():
                 raise RuntimeError("chunk encode failed %d: %s"
                                    % (i, err[-300:]))
-            made.append(part)
-            t_enc = time.time() - t_chunk - t_extract - t_model
-            # a chunk takes the better part of a minute, so reporting
-            # every tenth one left eight minutes of silence and looked
-            # exactly like a hang. report on a timer instead, with an
-            # ETA, and say where the time is actually going.
-            now = time.time()
-            done_s = min(info["dur"], (i + 1) * SR_CHUNK_SEC)
-            rate = done_s / max(1e-6, now - t0)
-            if i == 0 or (now - last_report) > PROGRESS_EVERY_SEC \
-                    or (i + 1) == n_chunks:
-                last_report = now
-                left = max(0.0, info["dur"] - done_s) / max(1e-6, rate)
-                log.info("    sr chunk %d/%d  %4.1f pct  %.2fx realtime  "
-                         "%s left" % (i + 1, n_chunks,
-                                      100.0 * (i + 1) / n_chunks,
-                                      rate, hms(left)))
-                log.debug("    sr chunk %d timing: extract %.1fs, model "
-                          "%.1fs, encode %.1fs, total %.1fs (%d frames)"
-                          % (i + 1, t_extract, t_model, t_enc,
-                             now - t_chunk, n_frames))
-                sr_ticks += 1
-                if sr_ticks % 3 == 1:
-                    # the one phase that had no resource sampling at all,
-                    # which is why a seven hour render was invisible
-                    log_resources(log, "during sr upscale", phase="sr")
-            # Breathe between chunks. An upscale otherwise holds the GPU,
-            # the CPU and the disk at full tilt for eleven hours without
-            # a single gap, which is the load profile the machine has
-            # now locked up under three times. A couple of seconds a
-            # chunk is a few percent of throughput.
-            if SR_CHUNK_PAUSE_SEC > 0:
-                time.sleep(SR_CHUNK_PAUSE_SEC)
+            return part, time.time() - t_e
+
+        # THE RESIDENT UPSCALER. One process for the whole file rather
+        # than one per chunk; see SrServer. ncnn cannot do this - it is a
+        # one-shot binary - so that backend keeps the old call.
+        srv = None
+        if sr_be == "cuda":
+            _cpu = cpu_budget()
+            srv = SrServer(Path(__file__).resolve().parent
+                           / "av1_upscale_cuda.py",
+                           model, scale, sr_tiles[0], GPU_MAX_PCT,
+                           _cpu, max(2, min(8, (_cpu or 8) // 2)), log,
+                           out_wh=sr_out_wh)
+            if not srv.start():
+                srv = None
+
+        ex_x = cf.ThreadPoolExecutor(max_workers=1)
+        ex_e = cf.ThreadPoolExecutor(max_workers=1)
+        fut_x = {}
+        fut_e = None
+        chunks_done = 0
+        i = -1
+        try:
+            fut_x[0] = ex_x.submit(do_extract, 0)
+            for i in range(n_chunks):
+                want, _start = chunk_span(i)
+                if want <= 0:
+                    break
+                t_chunk = time.time()
+                _t_wait = time.time()
+                n_frames, t_extract = fut_x.pop(i).result()
+                sr_stats["wait_x"] += time.time() - _t_wait
+                if n_frames == 0:
+                    if i == 0:
+                        raise RuntimeError("no frames came out of the source")
+                    break
+                # queue the next extraction NOW so it runs under the model
+                if i + 1 < n_chunks and chunk_span(i + 1)[0] > 0:
+                    fut_x[i + 1] = ex_x.submit(do_extract, i + 1)
+                total_frames += n_frames
+                f_in, f_out = slot_in[i % SLOTS], slot_out[i % SLOTS]
+                for f in f_out.glob("*.png"):
+                    f.unlink()
+                # tile as large as the card will take, stepping down only if
+                # it will not fit. an out of memory refusal here used to end
+                # the whole file; now it costs one retry.
+                got = 0
+                rc, out, err = -1, "", ""
+                chunk_metrics = None
+                for t_try in sr_tiles:
+                    # Look before allocating. The step-down ladder below only
+                    # helps when the tool exits cleanly with an error; when
+                    # the card is genuinely full the driver resets instead,
+                    # which is not a return code, it is the display going
+                    # away. So wait for room first, and drop to a smaller
+                    # tile if it never appears.
+                    # heat first, then memory. Both are refusals to add load
+                    # to a card that is already at a limit.
+                    gpu_wait_for_cool(log)
+                    # run_scale, not scale: on CUDA the model computes at
+                    # x4 whatever was asked for, and this figure decides
+                    # whether there is room to start at all.
+                    need = SR_TILE_COST_400.get(run_scale, 1690.0) * \
+                        ((t_try or 400) / 400.0) ** 2
+                    if not gpu_wait_for_headroom(need, log):
+                        rc, out, err = 125, "", "insufficient gpu headroom"
+                        if t_try != sr_tiles[-1]:
+                            log.warning("    not enough video memory for tile "
+                                        "%s; trying a smaller one"
+                                        % (t_try or "auto"))
+                        continue
+                    if srv is not None:
+                        # The resident upscaler holds its tile for the life of
+                        # the process, so stepping down means restarting it.
+                        # That costs one torch import, not a file, and it
+                        # happens at most once per file.
+                        if srv.tile != int(t_try or 0):
+                            if not srv.restart(t_try):
+                                srv = None
+                        if srv is not None:
+                            chunk_metrics, serr = srv.run(f_in, f_out)
+                            rc = 0 if chunk_metrics is not None else 1
+                            out, err = "", serr
+                    if srv is None:
+                        if sr_be == "cuda":
+                            # Same argument shape as the ncnn binary on
+                            # purpose, so this call site stays one command
+                            # either way. Used when the resident server could
+                            # not start, or after it died.
+                            srcmd = [sys.executable,
+                                     str(Path(__file__).resolve().parent
+                                         / "av1_upscale_cuda.py"),
+                                     "-i", str(f_in), "-o", str(f_out),
+                                     "-n", model, "-s", str(scale),
+                                     "-f", "png",
+                                     "--json-metrics", str(sr_metrics_path),
+                                     # The same ceilings the rest of the run
+                                     # obeys. Without these the upscaler is
+                                     # the one process on the machine with no
+                                     # cap on either resource.
+                                     "--vram-pct", str(GPU_MAX_PCT)]
+                            if sr_out_wh:
+                                srcmd += ["--out-w", str(sr_out_wh[0]),
+                                          "--out-h", str(sr_out_wh[1])]
+                            _cpu = cpu_budget()
+                            if _cpu:
+                                srcmd += ["--cpu-threads", str(_cpu),
+                                          "--io-threads",
+                                          str(max(2, min(8, _cpu // 2)))]
+                            if t_try:
+                                srcmd += ["-t", str(t_try)]
+                        else:
+                            srcmd = [TOOLS["realesrgan"], "-i", str(f_in),
+                                     "-o", str(f_out), "-n", model,
+                                     "-s", str(scale), "-f", "png"]
+                            if t_try:
+                                srcmd += ["-t", str(t_try)]
+                            if SR_THREADS:
+                                srcmd += ["-j", SR_THREADS]
+                        rc, out, err = run(srcmd, timeout=7200)
+                    got = len(list(f_out.glob("*.png")))
+                    if rc == 0 and got == n_frames:
+                        if t_try != sr_tiles[0]:
+                            log.warning("    tile %s did not fit; settled at "
+                                        "%s for the rest of this file"
+                                        % (sr_tiles[0], t_try or "auto"))
+                            sr_tiles = [t_try]
+                        break
+                    for f in f_out.glob("*.png"):
+                        f.unlink()
+                    if t_try != sr_tiles[-1]:
+                        log.debug("sr tile %s failed rc=%s, stepping down"
+                                  % (t_try, rc))
+                if rc != 0 or got != n_frames:
+                    raise RuntimeError("realesrgan failed chunk %d rc %s "
+                                       "(%d of %d frames): %s"
+                                       % (i, rc, got, n_frames,
+                                          (err or out)[-300:]))
+                t_model = time.time() - t_chunk - t_extract
+                # Pull the backend's own numbers in. Wall time alone cannot
+                # tell a slow model from slow disk I/O, and on the very
+                # first CUDA benchmark that distinction was the whole story:
+                # 4.3 s of model inside 66 s of run, because the image I/O
+                # was single-threaded. Recording both means the next such
+                # regression is visible in the log instead of being
+                # rediscovered.
+                if sr_be == "cuda":
+                    try:
+                        m = chunk_metrics
+                        if m is None:
+                            m = json.loads(sr_metrics_path.read_text(
+                                encoding="utf-8"))
+                        sr_stats["model_s"] += float(m.get("seconds_model", 0))
+                        sr_stats["frames"] += int(m.get("frames", 0))
+                        sr_stats["peak_vram_mb"] = max(
+                            sr_stats["peak_vram_mb"],
+                            float(m.get("peak_vram_mb", 0)))
+                        if i == 0:
+                            log.info("    sr backend: %s %s, torch %s / CUDA "
+                                     "%s, %s, tile %s"
+                                     % (m.get("device"), m.get("capability"),
+                                        m.get("torch"), m.get("cuda"),
+                                        m.get("precision"), m.get("tile")))
+                        log.debug("    sr chunk %d metrics: %.2f fps model, "
+                                  "%.2f fps wall, %.0f MB peak vram"
+                                  % (i, m.get("fps_model_only", 0),
+                                     m.get("fps", 0), m.get("peak_vram_mb", 0)))
+                    except Exception as e:
+                        log.debug("no sr metrics for chunk %d: %s" % (i, e))
+                # Collect the previous chunk's encode, then start this one and
+                # carry straight on to the next model pass. Exactly one encode
+                # is in flight at a time: NVENC is one hardware block, and a
+                # second concurrent session would only make both slower while
+                # holding a third slot's frames on disk. Collecting in order
+                # keeps `made` in chunk order, which the concat depends on.
+                t_enc = 0.0
+                if fut_e is not None:
+                    _t_wait = time.time()
+                    _part, t_enc = fut_e[1].result()
+                    sr_stats["wait_e"] += time.time() - _t_wait
+                    made.append(_part)
+                    fut_e = None
+                fut_e = (i, ex_e.submit(do_encode, i, n_frames))
+                chunks_done += 1
+                # a chunk takes the better part of a minute, so reporting
+                # every tenth one left eight minutes of silence and looked
+                # exactly like a hang. report on a timer instead, with an
+                # ETA, and say where the time is actually going.
+                now = time.time()
+                done_s = min(info["dur"], (i + 1) * SR_CHUNK_SEC)
+                rate = done_s / max(1e-6, now - t0)
+                if i == 0 or (now - last_report) > PROGRESS_EVERY_SEC \
+                        or (i + 1) == n_chunks:
+                    last_report = now
+                    left = max(0.0, info["dur"] - done_s) / max(1e-6, rate)
+                    log.info("    sr chunk %d/%d  %4.1f pct  %.2fx realtime  "
+                             "%s left" % (i + 1, n_chunks,
+                                          100.0 * (i + 1) / n_chunks,
+                                          rate, hms(left)))
+                    # extract and encode run alongside the model now, so
+                    # their own durations no longer add up to the chunk time.
+                    # The waits are what matter: if either is above zero for
+                    # long, that stage has become the bottleneck instead.
+                    log.debug("    sr chunk %d timing: model %.1fs, total "
+                              "%.1fs (%d frames); alongside: extract %.1fs, "
+                              "encode %.1fs; waited %.2fs on extract, %.2fs "
+                              "on encode"
+                              % (i + 1, t_model, now - t_chunk, n_frames,
+                                 t_extract, t_enc,
+                                 sr_stats["wait_x"], sr_stats["wait_e"]))
+                    sr_ticks += 1
+                    if sr_ticks % 3 == 1:
+                        # the one phase that had no resource sampling at all,
+                        # which is why a seven hour render was invisible
+                        log_resources(log, "during sr upscale", phase="sr")
+                # Breathe between chunks. An upscale otherwise holds the GPU,
+                # the CPU and the disk at full tilt for eleven hours without
+                # a single gap, which is the load profile the machine has
+                # now locked up under three times. A couple of seconds a
+                # chunk is a few percent of throughput.
+                if SR_CHUNK_PAUSE_SEC > 0:
+                    time.sleep(SR_CHUNK_PAUSE_SEC)
+        finally:
+            # The last encode is still running, and its part is needed by
+            # the concat. Collect it before anything else, and only then
+            # let the pools and the resident upscaler go. On an exception
+            # the same path runs: the pools are shut down and the server
+            # is stopped rather than left holding the card.
+            try:
+                if fut_e is not None:
+                    made.append(fut_e[1].result()[0])
+            finally:
+                fut_x.clear()
+                ex_x.shutdown(wait=True)
+                ex_e.shutdown(wait=True)
+                if srv is not None:
+                    srv.stop()
+                    srv = None
+        # EVERY CHUNK MUST HAVE PRODUCED A PART.
+        #
+        # The frame check further down counts frames EXTRACTED, which is
+        # not the same thing as frames shipped. The first version of the
+        # overlapped loop had the model and encode stages one indentation
+        # level out, so they ran once after the loop rather than once per
+        # chunk: all 7 chunks were extracted and counted, the frame check
+        # passed at 1860 in / 1860 out, and the file went out 2 seconds
+        # long. Only the duration gate caught it, at the very end.
+        #
+        # Counting the parts is the cheap check that catches it at once.
+        if len(made) != chunks_done or chunks_done == 0:
+            raise RuntimeError(
+                "the upscale processed %d chunks but produced %d encoded "
+                "parts. Concatenating them would ship a file of the wrong "
+                "length, so this file is failed instead."
+                % (chunks_done, len(made)))
+        log.debug("    sr parts: %d for %d chunks" % (len(made), chunks_done))
         lst = work / "concat.txt"
         lst.write_text("".join("file '%s'\n" % m.as_posix()
                                for m in made), encoding="utf-8")
@@ -4991,19 +6470,48 @@ def sr_encode(ctx, enc_input, info, an, plan, tmp_out, log, tag,
         # boundaries shifts the whole picture timeline against the
         # audio. Nothing was counting, so it would have shown up only as
         # a duration check failure at the very end, if at all.
-        expect = int(round(info["dur"] * info["fps"]))
-        if total_frames and abs(total_frames - expect) > 2:
-            log.warning("    sr frame count: %d frames from the chunks "
-                        "against %d expected for %.3f s at %.3f fps "
-                        "(%+d). chunk boundaries are not landing cleanly "
-                        "and the picture may drift against the audio."
-                        % (total_frames, expect, info["dur"], info["fps"],
-                           total_frames - expect))
-            plan["notes"].append("sr_frame_count_off_%+d"
-                                 % (total_frames - expect))
-        else:
-            log.debug("sr frame count: %d, expected %d"
-                      % (total_frames, expect))
+        # THE LENGTH GATE. This used to warn and carry on, which is how
+        # four files reached the duration check ninety minutes later
+        # having gained ~110 frames apiece. A warning nobody acts on is
+        # not a check.
+        #
+        # Every frame is now accounted for by construction - exact
+        # counts per chunk, short chunks padded with a duplicate - so a
+        # mismatch here means an assumption above is wrong, and shipping
+        # it would mean permanent sync drift against audio that comes
+        # from the master's own timeline. Fail instead.
+        if total_frames != expect_frames:
+            drift = (total_frames - expect_frames) / max(1e-6, fps_exact)
+            raise RuntimeError(
+                "the upscale produced %d frames against %d in the source "
+                "(%+d, %+.3f s). Any deviation in length breaks sync, so "
+                "this file is failed rather than shipped."
+                % (total_frames, expect_frames,
+                   total_frames - expect_frames, drift))
+        log.info("    sr frame check: %d frames in, %d out, exact. "
+                 "Picture is %.3f s, matching the source timeline."
+                 % (expect_frames, total_frames,
+                    total_frames / fps_exact))
+        # The run's own performance record, in the log, every time.
+        _wall = max(1e-6, time.time() - t0)
+        log.info("    sr summary: backend=%s model=%s scale=x%d tile=%s"
+                 % (sr_be, model, scale, sr_tiles[0] or "auto"))
+        log.info("    sr summary: %d frames in %s, %.2f fps overall, "
+                 "%.2fx realtime"
+                 % (total_frames, hms(_wall), total_frames / _wall,
+                    (total_frames / fps_exact) / _wall))
+        if sr_be == "cuda" and sr_stats["model_s"] > 0:
+            log.info("    sr summary: %.1f s of that was model inference "
+                     "(%.0f%% of wall), %.2f fps model-only, peak vram "
+                     "%.0f MB"
+                     % (sr_stats["model_s"],
+                        100.0 * sr_stats["model_s"] / _wall,
+                        sr_stats["frames"] / max(1e-6,
+                                                 sr_stats["model_s"]),
+                        sr_stats["peak_vram_mb"]))
+            plan["notes"].append("sr_cuda_%.1ffps" % (total_frames / _wall))
+            plan["notes"].append("sr_peakvram_%dmb"
+                                 % int(sr_stats["peak_vram_mb"]))
         # single mux: fresh video plus everything else off the source;
         # the audio and sub builders write input-0 maps, repoint at 1
         rest = audio_args(info, plan, extra_audio)
@@ -6241,27 +7749,42 @@ def process_file(ctx, idx, total, item, prefetch=None):
         # the test is on the SOURCE being SDR, not on the output space.
         # out_space turns into hdr10 whenever --sdr-to-hdr is on, and
         # reading that here used to switch Real-ESRGAN off silently
+        # The gate asks the BACKEND, not the ncnn binary. It used to
+        # require realesrgan-ncnn-vulkan on disk, which would send a
+        # machine with a working CUDA upscaler down the lanczos path
+        # because a 2022 Vulkan exe it no longer needs was absent.
         use_sr = bool(plan["upscaled"]) and not ctx["no_sr"] \
             and info["hdr"] == "sdr" \
-            and bool(TOOLS.get("realesrgan")) and cfr_like(info)
+            and bool(sr_backend(log)) \
+            and sr_model_present(ctx["sr_model"]) and cfr_like(info)
         # NOW start preparing the next file, not a moment earlier. its
         # probe, analysis and whisper overlap a NORMAL encode for almost
         # nothing (measured: 10.5 s alone against 10.9 s alongside), but
         # if they are allowed to start while THIS file is still doing its
         # own whisper the two fight over the GPU and it runs 3.3x slower.
         #
-        # It is skipped entirely when this file is going through the AI
-        # upscaler. That path already holds the GPU on Vulkan compute,
-        # the CPU on the per-chunk encode and the disk on frame IO, for
-        # hours at a stretch. Stacking whisper and a translation pass on
-        # top of it is the heaviest combined draw this pipeline can
-        # produce, and it is what the machine was doing at 10:56:41 on
-        # 2026-08-09 when it locked hard. The overlap is worth about 20
-        # percent; it is not worth the box.
+        # It used to be skipped entirely when the file was going through
+        # the AI upscaler, on the grounds that stacking whisper on top of
+        # the upscale was the heaviest combined draw the pipeline can
+        # produce, and that this was what the machine was doing at
+        # 10:56:41 on 2026-08-09 when it locked hard.
+        #
+        # REINSTATED 2026-08-17, at Tom's instruction. The lockups were
+        # traced to the ncnn/Vulkan binary against Blackwell's 64 KB
+        # alignment requirement, not to load - the card died cold with
+        # 14 GB free - and that path is gone: the upscaler is CUDA now.
+        # The upscale also no longer holds the CPU the way it did, since
+        # the chunk encode runs on NVENC alongside the model rather than
+        # in front of it.
+        #
+        # IF THE MACHINE LOCKS UP AGAIN, THIS IS THE FIRST THING TO
+        # REVERSE: set sr_prefetch_during = 0. It is a config key rather
+        # than a code edit precisely so it can be turned off from the
+        # other side of a hard reboot without touching the source.
         prep = ctx.get("prep_next")
-        if prep and use_sr:
-            log.info("    background preparation held back: the upscaler "
-                     "needs the whole machine")
+        if prep and use_sr and not SR_PREFETCH_DURING:
+            log.info("    background preparation held back: "
+                     "sr_prefetch_during is off")
         elif prep:
             try:
                 prep()
@@ -6270,13 +7793,23 @@ def process_file(ctx, idx, total, item, prefetch=None):
                           exc_info=True)
         if plan["upscaled"]:
             if use_sr:
-                plan["notes"].append("upscale_realesrgan_" + ctx["sr_model"])
+                plan["notes"].append("upscale_%s_%s"
+                                     % (sr_backend(log), ctx["sr_model"]))
             else:
                 why2 = ("flag_off" if ctx["no_sr"] else
-                        "tool_missing" if not TOOLS.get("realesrgan") else
+                        "no_backend" if not sr_backend(log) else
+                        "model_missing"
+                        if not sr_model_present(ctx["sr_model"]) else
                         "hdr_source" if info["hdr"] != "sdr" else
                         "vfr_source")
                 plan["notes"].append("upscale_lanczos_fallback_" + why2)
+                if why2 == "model_missing":
+                    log.warning("    the upscaler is installed but the %s "
+                                "model is not next to it. Real-ESRGAN's own "
+                                "release zips carry no weights; the bundle "
+                                "on the main Real-ESRGAN repo does. Using "
+                                "lanczos for this file."
+                                % ctx["sr_model"])
         used_cq = None
         vmaf_low = None
         # Subtitles are acquired BEFORE either encode path runs.
@@ -6806,6 +8339,14 @@ def main(argv=None):
     # Blank sr_tmp_dir means "work it out", which is what a machine
     # other than this one needs. Setting it means "use this disk", and
     # that still wins.
+    global SR_BACKEND
+    if cfg.get("sr_backend") is not None:
+        v = str(cfg["sr_backend"]).strip().lower()
+        if v in ("auto", "cuda", "ncnn", "off"):
+            SR_BACKEND = v
+        elif v:
+            print("config sr_backend must be auto, cuda, ncnn or off; "
+                  "using auto")
     global SCRATCH_AUTO, SCRATCH_MIN_FREE_GB
     if cfg.get("scratch_auto") is not None:
         SCRATCH_AUTO = truthy(cfg["scratch_auto"])
@@ -6871,10 +8412,18 @@ def main(argv=None):
         AUDIO_DOWNMIX = truthy(cfg.get("audio_downmix"))
     if cfg.get("audio_denoise") is not None:
         AUDIO_DENOISE = truthy(cfg.get("audio_denoise"))
-    global CAS_STRENGTH, SD_SATURATION
+    global SR_PREFETCH_DURING
+    if cfg.get("sr_prefetch_during") is not None:
+        SR_PREFETCH_DURING = 1 if truthy(cfg.get("sr_prefetch_during")) else 0
+    global CAS_STRENGTH, SD_SATURATION, SDR_TO_HDR_SATURATION
     for key, name, lo, hi in (("cas_strength", "CAS_STRENGTH", 0.0, 1.0),
                               ("sr_chunk_pause_sec", "SR_CHUNK_PAUSE_SEC",
                                0.0, 60.0),
+                              # the 30 percent ceiling, enforced on load
+                              # as well as in placebo_filter()
+                              ("sdr_to_hdr_saturation",
+                               "SDR_TO_HDR_SATURATION",
+                               SDR_HDR_SAT_MIN, SDR_HDR_SAT_MAX),
                               ("sd_saturation", "SD_SATURATION", 0.5, 2.0)):
         if cfg.get(key) is not None:
             try:
@@ -7002,6 +8551,24 @@ def main(argv=None):
             CPU_MAX_PCT = max(0, min(100, int(cfg["cpu_max_pct"])))
         except ValueError:
             print("config cpu_max_pct is not a number, leaving it")
+    # NOTHING RUNS AT 100 PERCENT.
+    #
+    # Every resource ceiling is clamped to 98 here, whatever the config
+    # asked for, so there is always headroom for the desktop, the
+    # compositor and the operating system itself. A GPU allocation that
+    # does not fit is not a polite failure - it takes the display driver
+    # with it - and a machine pinned at 100 pct CPU stops responding to
+    # the person trying to find out why.
+    #
+    # 98 rather than a rounder number because it is what the video
+    # memory cap was already measured at: the compositor holds about
+    # 1.8 GB of a 16 GB board, which is comfortably inside 2 pct.
+    for _name in ("GPU_MAX_PCT", "CPU_MAX_PCT"):
+        _v = globals().get(_name)
+        if isinstance(_v, (int, float)) and _v > UTILISATION_CEILING_PCT:
+            print("%s was %s; clamped to %d to leave room for the system"
+                  % (_name, _v, UTILISATION_CEILING_PCT))
+            globals()[_name] = UTILISATION_CEILING_PCT
     # apply the cap to ourselves as soon as it is known, and before any
     # of the heavy native libraries get a chance to size their own
     # thread pools against the whole machine
@@ -7477,8 +9044,60 @@ def selftest():
       pick_sr_scale(540, "realesr-animevideov3") == 2)
     t("sr scale: 240 lines caps at x4",
       pick_sr_scale(240, "realesr-animevideov3") == 4)
+    # model_scales still answers for a name that is not offered, because
+    # a stale config or an old command line can still supply one.
     t("sr scale: x4plus holds x4",
       pick_sr_scale(720, "realesrgan-x4plus") == 4)
+    # The SDR->HDR saturation ceiling. A look control on a path that
+    # rewrites the colour of every SDR file in a batch, so the limit is
+    # enforced in the accessor rather than trusted to the config loader.
+    _sat_save = SDR_TO_HDR_SATURATION
+    try:
+        globals()["SDR_TO_HDR_SATURATION"] = 3.0
+        t("sdr->hdr: saturation is capped at +30 percent",
+          sdr_hdr_saturation() == SDR_HDR_SAT_MAX and SDR_HDR_SAT_MAX == 1.30)
+        globals()["SDR_TO_HDR_SATURATION"] = 0.01
+        t("sdr->hdr: saturation has a floor",
+          sdr_hdr_saturation() == SDR_HDR_SAT_MIN)
+        globals()["SDR_TO_HDR_SATURATION"] = 0.85
+        t("sdr->hdr: a value inside the range passes through",
+          abs(sdr_hdr_saturation() - 0.85) < 1e-9)
+        globals()["SDR_TO_HDR_SATURATION"] = "nonsense"
+        t("sdr->hdr: an unreadable value falls back to neutral",
+          sdr_hdr_saturation() == 1.0)
+    finally:
+        globals()["SDR_TO_HDR_SATURATION"] = _sat_save
+    t("sdr->hdr: the default applies no lift",
+      abs(sdr_hdr_saturation() - 1.0) < 1e-9)
+    t("sr model: general-x4v3 is the default",
+      SR_MODEL_DEFAULT == "realesr-general-x4v3")
+    t("sr model: the default is offered",
+      SR_MODEL_DEFAULT in SR_MODELS)
+    # 43 hours for one hour of 480i, measured. Not an option anyone
+    # should be able to pick by accident.
+    t("sr model: the 23-block x4plus is not offered",
+      "realesrgan-x4plus" not in SR_MODELS)
+    # Every offered model must be buildable and fetchable, or choosing it
+    # fails at the point of no return rather than at startup. This is the
+    # check that would have caught realesr-general-x4v3 having no
+    # architecture entry and no URL.
+    try:
+        import av1_upscale_cuda as _UC
+        t("sr model: every offered model has a known architecture",
+          all(m in _UC.MODEL_ARCH for m in SR_MODELS))
+        t("sr model: every offered model has a weights URL",
+          all(m in _UC.MODEL_URLS for m in SR_MODELS))
+        t("sr model: the architecture table matches the reference impl",
+          _UC.MODEL_ARCH["realesr-animevideov3"] == ("srvgg",
+                                                     {"num_conv": 16})
+          and _UC.MODEL_ARCH["realesr-general-x4v3"] == ("srvgg",
+                                                         {"num_conv": 32})
+          and _UC.MODEL_ARCH["realesrgan-x4plus-anime"] == ("rrdb",
+                                                            {"num_block": 6})
+          and _UC.MODEL_ARCH["realesrgan-x4plus"] == ("rrdb",
+                                                      {"num_block": 23}))
+    except ImportError:
+        t("sr model: every offered model has a known architecture", False)
     t("cfr guard: matched rates pass",
       cfr_like({"rr": 23.976, "ar": 23.976}))
     t("cfr guard: split rates fail",
@@ -7669,6 +9288,23 @@ def selftest():
     except Exception:
         t("subs: the translator takes a source language, not just English",
           False)
+    # A Windows drive colon has to survive TWO ffmpeg escaping layers.
+    # With one backslash every absolute-path whisper attempt failed with
+    # "No option name near '/ProgramData/...'", silently, for versions -
+    # leaving only the bare-name form working. Measured on 8.1.2.
+    try:
+        import av1_subs as _SB2
+        _esc = _SB2.esc_filter_path(r"C:\ProgramData\whisper\m.bin")
+        t("subs: a drive colon is escaped for the filter parser, twice",
+          _esc == "C\\\\:/ProgramData/whisper/m.bin")
+        t("subs: backslashes become forward slashes",
+          "\\" not in _SB2.esc_filter_path(r"C:\x\y\z.bin").replace(
+              "\\\\:", ":"))
+        t("subs: a relative name is left alone",
+          _SB2.esc_filter_path("out.srt") == "out.srt")
+    except Exception:
+        t("subs: a drive colon is escaped for the filter parser, twice",
+          False)
     # the ledger: the primitive that names the stage that broke the file
     _good = {"video": [{"dur": 6056.0}],
              "audio": [{"dur": 6056.0}, {"dur": 6055.5}]}
@@ -7753,6 +9389,334 @@ def selftest():
           _MD.strip_tech_suffix("AV1 Rising") == "AV1 Rising")
         t("meta: tech suffix stripper removes repeats",
           _MD.strip_tech_suffix("Ep Title_AV1_AV1") == "Ep Title")
+
+    # --- nothing runs at 100 percent -------------------------------------
+    t("caps: the ceiling is 98, leaving room for the system",
+      UTILISATION_CEILING_PCT == 98)
+    t("caps: the GPU cap is at or under the ceiling",
+      GPU_MAX_PCT <= UTILISATION_CEILING_PCT)
+    t("caps: the CPU cap is at or under the ceiling",
+      CPU_MAX_PCT <= UTILISATION_CEILING_PCT)
+    # cpu_budget() must always leave at least one core free, or the
+    # machine has nothing left to schedule the desktop on.
+    _saved_cpu = CPU_MAX_PCT
+    try:
+        _total = os.cpu_count() or 1
+        for _pct in (98, 88, 80, 50):
+            globals()["CPU_MAX_PCT"] = _pct
+            _n = cpu_budget()
+            t("caps: cpu_max_pct=%d leaves the machine a core (%d of %d)"
+              % (_pct, _n, _total), 0 < _n < _total or _total == 1)
+    finally:
+        globals()["CPU_MAX_PCT"] = _saved_cpu
+    # The video-memory reserve must never hand the upscaler the whole
+    # board, whatever the card size.
+    _saved_enc2 = CAPS.get("encoder")
+    CAPS["encoder"] = "nvenc"
+    for _board in (8192.0, 16311.0, 24576.0, 49152.0):
+        _r = sr_vram_reserve(_board)
+        t("caps: a %.0f GB card keeps %.0f MB back for the desktop"
+          % (_board / 1024.0, _r), _r >= SR_VRAM_RESERVE_MIN_MB)
+    if _saved_enc2 is None:
+        CAPS.pop("encoder", None)
+    else:
+        CAPS["encoder"] = _saved_enc2
+
+    # --- SR chunking must not gain frames --------------------------------
+    # Four files failed on 2026-08-16 with the picture running long. Ten
+    # seconds is not a whole number of frames at any NTSC-fractional
+    # rate, so selecting a chunk by DURATION rounds up every time and
+    # the remainder accumulates over hundreds of chunks.
+    def _chunk_total(dur, fps, chunk=10.0):
+        """Frames the new frame-exact chunker produces in total."""
+        per = max(1, int(round(chunk * fps)))
+        expect = int(round(dur * fps))
+        n = max(1, int(math.ceil(dur / chunk)))
+        got = 0
+        for i in range(n):
+            start_frame = i * per
+            want = min(per, expect - start_frame)
+            if want <= 0:
+                break
+            got += want
+        return got, expect
+
+    for _dur, _fps, _label, _was in (
+            (4464.432, 30000 / 1001.0, "Dead Space 29.97", 133934),
+            (4450.279167, 24000 / 1001.0, "Son of Batman 23.976", 106808),
+            (4611.35675, 24000 / 1001.0, "JL Doom 23.976", 110674)):
+        _got, _exp = _chunk_total(_dur, _fps)
+        t("sr: %s chunks to exactly the right frame count" % _label,
+          _got == _exp)
+        # what the old duration-based chunker produced, for the record
+        _old = int(math.ceil(_dur / 10.0)) * int(math.ceil(10.0 * _fps))
+        t("sr: %s - the old chunker really did over-run" % _label,
+          _old > _exp)
+
+    t("sr: a 25 fps source was never affected (whole frames per chunk)",
+      _chunk_total(3600.0, 25.0)[0] == _chunk_total(3600.0, 25.0)[1])
+
+    # The COUNTED frame total wins over duration x rate, and the
+    # partition still lands exactly on it even when the two disagree -
+    # which is the case that produces silent drift.
+    def _partition(total, fps, chunk=10.0):
+        per = max(1, int(round(chunk * fps)))
+        n = max(1, int(math.ceil(total / float(per))))
+        out = []
+        for i in range(n):
+            want = min(per, total - i * per)
+            if want <= 0:
+                break
+            out.append(want)
+        return out
+
+    for _total, _fps in ((110559, 24000 / 1001.0),
+                         (133799, 30000 / 1001.0),
+                         (1, 24000 / 1001.0),
+                         (239, 24000 / 1001.0)):
+        _parts = _partition(_total, _fps)
+        t("sr: %d frames at %.3f fps partition exactly"
+          % (_total, _fps), sum(_parts) == _total)
+        t("sr: %d frames - no chunk exceeds its quota" % _total,
+          all(0 < p <= max(1, int(round(10.0 * _fps))) for p in _parts))
+    # Duration follows from the frame count alone, because the chunk
+    # encode is given the exact fractional rate. Same frames in and out
+    # means same running time, which is what keeps sync.
+    t("sr: equal frame counts give equal running time",
+      abs(110562 / (24000 / 1001.0) - 110562 / (24000 / 1001.0)) < 1e-9)
+    t("sr: one frame of drift at 23.976 is 41.7 ms",
+      abs(1.0 / (24000 / 1001.0) - 0.0417) < 0.0002)
+
+    # --- the journal must never kill a file ------------------------------
+    import tempfile as _tf2
+    with _tf2.TemporaryDirectory() as _jd:
+        _j = Journal(Path(_jd) / "_journal.json")
+        _j.update("a/b.mkv", status="done")
+        t("journal: a normal write works",
+          (Path(_jd) / "_journal.json").exists())
+        _saved_replace = os.replace
+
+        def _refuse(*a, **k):
+            raise PermissionError(5, "Access is denied")
+        os.replace = _refuse
+        try:
+            _ok = _j.save()
+            t("journal: an SMB-style refusal falls back rather than "
+              "raising", _ok is True)
+            t("journal: and the file is still readable afterwards",
+              json.loads((Path(_jd) / "_journal.json").read_text(
+                  encoding="utf-8")).get("files") is not None)
+        finally:
+            os.replace = _saved_replace
+
+    # --- subtitle track naming -------------------------------------------
+    # Two English tracks used to arrive as two identical menu entries.
+    _nm = sub_track_names([
+        {"idx": 3, "lang": "eng", "codec": "hdmv_pgs_subtitle",
+         "forced": False, "sdh": False, "title": ""},
+        {"idx": 4, "lang": "eng", "codec": "hdmv_pgs_subtitle",
+         "forced": False, "sdh": False, "title": ""}])
+    t("subs: two identical English tracks get distinct names",
+      _nm[3] != _nm[4] and "English" in _nm[3] and "English" in _nm[4])
+    _nm = sub_track_names([
+        {"idx": 3, "lang": "eng", "codec": "subrip", "forced": False,
+         "sdh": False, "title": ""},
+        {"idx": 4, "lang": "eng", "codec": "subrip", "forced": True,
+         "sdh": False, "title": ""},
+        {"idx": 5, "lang": "eng", "codec": "subrip", "forced": False,
+         "sdh": True, "title": ""}])
+    t("subs: forced and SDH are named as such",
+      _nm[3] == "English" and "Forced" in _nm[4] and "SDH" in _nm[5])
+    _nm = sub_track_names([
+        {"idx": 3, "lang": "eng", "codec": "ass", "forced": False,
+         "sdh": False, "title": "Signs & Songs"}])
+    t("subs: the source's own track name is preferred",
+      _nm[3] == "Signs & Songs")
+    _nm = sub_track_names([
+        {"idx": 3, "lang": "jpn", "codec": "ass", "forced": False,
+         "sdh": False, "title": ""}])
+    t("subs: a Japanese track is named Japanese", _nm[3] == "Japanese")
+
+    # --- duration measured on the PICTURE, not the container -------------
+    # A container's duration is the length of its LONGEST track. Trigun
+    # has 5433.4 s of video under a 5463.5 s Japanese FLAC, and the
+    # correct encode was failed for being 30 s short of a figure that
+    # never described the picture.
+    t("duration: the last-packet probe exists as a fallback",
+      callable(globals().get("probe_last_video_packet")))
+    t("duration: tolerance is a flat second, not a percentage",
+      abs(DURATION_TOLERANCE_SEC - 1.0) < 1e-6)
+
+    # --- the specified track layout --------------------------------------
+    def _mkinfo(auds, subs):
+        return {"audios": auds, "subs": subs, "bad_streams": [],
+                "dur": 3600.0}
+
+    def _a(idx, lang, ch):
+        return {"idx": idx, "lang": lang, "ch": ch, "layout": "5.1(side)",
+                "codec": "ac3", "bit_rate": 640000, "start": 0.0,
+                "title": "", "aux": False}
+
+    def _s(idx, lang, forced=False, codec="subrip"):
+        return {"idx": idx, "lang": lang, "codec": codec, "forced": forced,
+                "sdh": False}
+
+    # a1 English boosted, a2 English original, a3 Japanese unboosted
+    _pl = {"audio": None, "notes": []}
+    _inf = _mkinfo([_a(1, "eng", 6), _a(2, "jpn", 6)], [])
+    _pl["audio"] = _inf["audios"][0]
+    _args = audio_args(_inf, _pl)
+    _maps = [_args[i + 1] for i, x in enumerate(_args) if x == "-map"]
+    t("layout: an English film gets exactly three audio tracks",
+      len(_maps) == 3)
+    # a2 and a3 DO carry a filter - an aformat that normalises the
+    # channel layout, without which libopus refuses AC3's 5.1(side).
+    # What must be unique to a1 is the dialogue ENHANCEMENT.
+    def _filt_for(args, n):
+        flag = "-filter:a:%d" % n
+        for i, x in enumerate(args):
+            if x == flag:
+                return str(args[i + 1])
+        return ""
+    _boosted = [n for n in range(3)
+                if "dialoguenhance" in _filt_for(_args, n)]
+    t("layout: a1 is the only dialogue-boosted track", _boosted == [0])
+    t("layout: a1 is stereo", "-b:a:0" in _args)
+    t("layout: a2 carries no enhancement, only a layout fix",
+      "dialoguenhance" not in _filt_for(_args, 1)
+      and "loudnorm" not in _filt_for(_args, 1))
+    t("layout: a3 is Japanese and unboosted",
+      "dialoguenhance" not in _filt_for(_args, 2)
+      and "language=jpn" in " ".join(str(x) for x in _args))
+
+    # No English audio: the foreign track leads, at its own layout,
+    # with no dialogue boost anywhere.
+    _pl2 = {"audio": None, "notes": []}
+    _inf2 = _mkinfo([_a(1, "jpn", 6)], [])
+    _pl2["audio"] = _inf2["audios"][0]
+    _args2 = audio_args(_inf2, _pl2)
+    _maps2 = [_args2[i + 1] for i, x in enumerate(_args2) if x == "-map"]
+    _filts2 = [x for x in _args2 if str(x).startswith("-filter:a:")]
+    t("layout: with no English there is ONE audio track", len(_maps2) == 1)
+    t("layout: and a foreign primary is NOT dialogue boosted",
+      not any("dialoguenhance" in str(x) for x in _args2))
+    t("layout: and it keeps its original channel layout",
+      "-mapping_family:a:0" in _args2)
+
+    # Subtitle slots.
+    _sl = plan_subtitle_slots(
+        _mkinfo([_a(1, "eng", 6)], [_s(3, "eng"), _s(4, "jpn")]), [])
+    t("subs: English audio present -> slot 1 is the blank Off track",
+      _sl["slot1"] == "blank")
+    t("subs: slot 2 is English", _sl["slot2"] is not None
+      and _sl["slot2"]["idx"] == 3)
+    t("subs: slot 3 is Japanese", _sl["slot3"] is not None
+      and _sl["slot3"]["idx"] == 4)
+
+    _sl = plan_subtitle_slots(
+        _mkinfo([_a(1, "jpn", 6)], [_s(3, "eng"), _s(4, "jpn")]), [])
+    t("subs: NO English audio -> slot 1 is the English track",
+      _sl["slot1"] is not None and _sl["slot1"] != "blank"
+      and _sl["slot1"]["idx"] == 3)
+    t("subs: and English is NOT carried twice", _sl["slot2"] is None)
+
+    _sl = plan_subtitle_slots(
+        _mkinfo([_a(1, "jpn", 6)],
+                [_s(3, "eng"), _s(5, "eng", forced=True), _s(4, "jpn")]), [])
+    t("subs: forced English wins slot 1 over full English",
+      _sl["slot1"] is not None and _sl["slot1"] != "blank"
+      and _sl["slot1"]["idx"] == 5)
+    t("subs: and full English then takes slot 2",
+      _sl["slot2"] is not None and _sl["slot2"]["idx"] == 3)
+
+    _sl = plan_subtitle_slots(
+        _mkinfo([_a(1, "jpn", 6)], []),
+        [{"path": "x.srt", "lang": "eng", "title": "English (translated)"},
+         {"path": "y.srt", "lang": "jpn", "title": "Japanese"}])
+    t("subs: a GENERATED English track can hold slot 1",
+      isinstance(_sl["slot1"], dict) and _sl["slot1"].get("lang") == "eng")
+    t("subs: a generated Japanese track holds slot 3",
+      isinstance(_sl["slot3"], dict) and _sl["slot3"].get("lang") == "jpn")
+
+    # --- subtitles: language by content, not by tag ----------------------
+    # Two films shipped on 2026-08-13 with a subtitle track tagged
+    # English containing nothing but Japanese. Three separate faults
+    # combined to do it and all three are covered here.
+    import av1_subs as _SBL
+    # ESCAPED, NOT LITERAL. These were raw Japanese characters
+    # until a PowerShell Get-Content/Set-Content round-trip during
+    # a version bump read the UTF-8 as CP1252 and wrote mojibake
+    # back. Silent - the file still parsed, no replacement chars -
+    # and the only symptom was two selftest checks going red.
+    # Escapes are plain ASCII on disk and survive any round-trip.
+    _jp_line = '私は少佐だ。作戦を開始する'
+    _en_line = "I am the Major, begin the operation"
+    _jp_text = " ".join([_jp_line] * 12)
+    _en_text = " ".join([_en_line] * 12)
+    t("subs: Japanese text is detected as Japanese",
+      _SBL.sniff_language(_jp_text) == "jpn")
+    t("subs: English text is detected as Latin script",
+      _SBL.sniff_language(_en_text) == "latin")
+    # The realistic false positive: an English track carrying a few
+    # kanji in signs and song titles must NOT be called Japanese.
+    t("subs: English with a few kanji signs stays Latin",
+      _SBL.sniff_language(_en_text * 4 + ' 看板 東京')
+      == "latin")
+    t("subs: too little text gives no verdict rather than a guess",
+      _SBL.sniff_language("Hi.") == "unknown")
+    _prof = _SBL.script_profile(_jp_text)
+    t("subs: kana is what identifies Japanese",
+      _prof["kana"] > 0 and _prof["latin"] == 0)
+
+    # A translation that wholly fails must NOT write a file. Its caller
+    # labels whatever comes back as English and muxes it in, so
+    # returning the untranslated original is how the Japanese ended up
+    # on an English-tagged track.
+    import tempfile as _tf
+    _saved_tl = _SBL.translate_lines
+    try:
+        _SBL.translate_lines = lambda *a, **k: []      # total failure
+        with _tf.TemporaryDirectory() as _td:
+            _src = Path(_td) / "in.srt"
+            _src.write_text("1\n00:00:01,000 --> 00:00:04,000\n%s\n"
+                            % _jp_line, encoding="utf-8")
+            _r = _SBL.translate_srt(_src, Path(_td) / "out.srt", "EN",
+                                    "argos", "", log=None)
+            t("subs: a failed translation returns nothing, not the "
+              "untranslated original", _r is None)
+            t("subs: and writes no file to be mislabelled",
+              not (Path(_td) / "out.srt").exists())
+    finally:
+        _SBL.translate_lines = _saved_tl
+
+    # The argos pair check. The bug was testing whether the two
+    # LANGUAGES were installed rather than the directed PAIR: with
+    # en->ja present, both 'en' and 'ja' looked installed, ja->en was
+    # never downloaded, and every call returned [] silently.
+    class _FakeLang(object):
+        def __init__(self, code, to=()):
+            self.code = code
+            self._to = dict(to)
+
+        def get_translation(self, dst):
+            return self._to.get(dst.code)
+
+    class _FakeAt(object):
+        def __init__(self, langs):
+            self._l = langs
+
+        def get_installed_languages(self):
+            return self._l
+
+    _en = _FakeLang("en")
+    _ja = _FakeLang("ja")
+    _en._to = {"ja": "en->ja model"}      # only this direction exists
+    _fake = _FakeAt([_en, _ja])
+    t("subs: an installed en->ja is found",
+      _SBL._argos_pair(_fake, "en", "ja") == "en->ja model")
+    t("subs: a MISSING ja->en is reported missing even though both "
+      "languages are installed",
+      _SBL._argos_pair(_fake, "ja", "en") is None)
 
     # --- portability: GPU generations -----------------------------------
     # These decide nothing - the preflight's trial encode does - but a

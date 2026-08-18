@@ -29,6 +29,10 @@ import os
 import re
 import subprocess
 import urllib.parse
+from pathlib import Path   # module level: three functions imported this
+                           # locally and nothing else could see it, so
+                           # code added later raised NameError and had it
+                           # swallowed by a bare except
 
 # See the note in av1_metadata.py. Without this every whisper pass and
 # every audio extract flashes a console window over the desktop.
@@ -36,7 +40,7 @@ NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 import urllib.request
 
 # Moves with av1_pipeline_v0_1.VERSION, which selftest enforces.
-VERSION = "0.243"
+VERSION = "0.256"
 
 NET_TIMEOUT = 60
 # Whisper needs a ggml model from whisper.cpp. Bigger is better and
@@ -327,10 +331,32 @@ def whisper_options(ffmpeg, log=None):
 
 
 def esc_filter_path(pth):
-    # inside a filter argument the special characters are backslash,
-    # single quote and colon. forward slashes avoid the first entirely.
+    """Escape a path for use inside an ffmpeg filter option value.
+
+    A WINDOWS DRIVE COLON NEEDS TWO BACKSLASHES, NOT ONE.
+
+    ffmpeg escapes in layers - the filter's own option parser, then the
+    filtergraph parser - and a colon has to survive both. MEASURED on
+    8.1.2 with an argument list (no shell in the way, which is important:
+    Git Bash rewrites anything that looks like a POSIX path and turns
+    C\\:/x into nonsense that reads as an ffmpeg failure):
+
+        model=C\\:/ProgramData/...      WORKS
+        model='C\\:/ProgramData/...'    WORKS
+        model=C\\\\:/ProgramData/...    FAILS - one layer short
+        model='C\\:/ProgramData/...'    FAILS - quoting alone is not enough
+
+    With one backslash every absolute-path attempt failed with
+    "No option name near '/ProgramData/whisper/...'", so two of the three
+    fallbacks in whisper_srt could never work and only the bare-name form
+    ever transcribed anything. The colon is also why the destination has
+    to be escaped, not just the model.
+
+    The old version also replaced backslashes AFTER turning them all into
+    forward slashes, so that step could never match anything.
+    """
     s = str(pth).replace("\\", "/")
-    return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return s.replace("'", "\\'").replace(":", "\\\\:")
 
 
 def find_vad_model(model_dir):
@@ -435,8 +461,14 @@ def whisper_srt(ffmpeg, wav, model, lang, out_srt, use_gpu=True,
                          build(model.name, out_srt.name, vref),
                          str(model.parent), model.parent / out_srt.name))
     vabs = esc_filter_path(vad) if vad else None
+    # The destination needs the same escaping as the model - it is another
+    # option value in the same filter string, and out_srt is an absolute
+    # path with a drive colon in it. Passing out_srt.name here relied on
+    # cwd instead, which is why this attempt wrote into whichever folder
+    # it happened to be run from.
     attempts.append(("escaped absolute model path",
-                     build(esc_filter_path(model), out_srt.name, vabs),
+                     build(esc_filter_path(model),
+                           esc_filter_path(out_srt), vabs),
                      str(out_srt.parent), out_srt))
     attempts.append(("quoted absolute model path",
                      build("'" + esc_filter_path(model) + "'",
@@ -503,7 +535,159 @@ def _post(url, data, headers, timeout=NET_TIMEOUT):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+# ---------------------------------------------------------------------
+# Script detection: what language is this text ACTUALLY in?
+# ---------------------------------------------------------------------
+# A subtitle track's language TAG is a claim, not evidence. Two films in
+# the 2026-08-13 batch carried a track tagged "eng" whose text is
+# Japanese, and because the tag was believed, the pipeline kept it as
+# the English track and skipped generating a real one. The finished
+# files have an English-labelled track nobody can read.
+#
+# This detects SCRIPT, not language. That distinguishes Japanese from
+# English with certainty and is exactly the question being asked here;
+# it would NOT tell English from French, and nothing below pretends
+# otherwise.
+_SCRIPTS = (
+    ("kana", ((0x3040, 0x309F), (0x30A0, 0x30FF), (0x31F0, 0x31FF))),
+    ("han", ((0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0xF900, 0xFAFF))),
+    ("hangul", ((0xAC00, 0xD7AF), (0x1100, 0x11FF), (0x3130, 0x318F))),
+    ("cyrillic", ((0x0400, 0x04FF), (0x0500, 0x052F))),
+    ("arabic", ((0x0600, 0x06FF), (0x0750, 0x077F))),
+    ("hebrew", ((0x0590, 0x05FF),)),
+    ("thai", ((0x0E00, 0x0E7F),)),
+    ("greek", ((0x0370, 0x03FF),)),
+    ("devanagari", ((0x0900, 0x097F),)),
+)
+
+
+def script_profile(text):
+    """Count the letters of each script in a block of text.
+
+    Punctuation, digits and whitespace are ignored: they are shared
+    between scripts and would dilute the ratios that matter.
+    """
+    counts = dict((name, 0) for name, _ in _SCRIPTS)
+    counts["latin"] = 0
+    for ch in text or "":
+        o = ord(ch)
+        if o < 0x80:
+            if ch.isalpha():
+                counts["latin"] += 1
+            continue
+        hit = None
+        for name, ranges in _SCRIPTS:
+            for lo, hi in ranges:
+                if lo <= o <= hi:
+                    hit = name
+                    break
+            if hit:
+                break
+        if hit:
+            counts[hit] += 1
+        elif ch.isalpha() and o < 0x250:
+            # Latin-1 supplement and Latin Extended-A: accented Latin.
+            counts["latin"] += 1
+    return counts
+
+
+def sniff_language(text, min_chars=40):
+    """Best guess at the language of subtitle text, from its script.
+
+    Returns an ISO-639-2 style code where the script settles it, "latin"
+    where the script is Latin but the language is not determined, or
+    "unknown" when there is too little to judge.
+
+    KANA IS DECISIVE. Hiragana and katakana appear in no other language,
+    so any real presence of them means Japanese. The threshold is 4 pct
+    rather than zero because an English subtitle for an anime legitimately
+    carries a few kana in signs and song titles - measured against a real
+    two-hour English track, that is well under one percent, so the two
+    cases separate cleanly.
+    """
+    c = script_profile(text)
+    total = sum(c.values())
+    if total < min_chars:
+        return "unknown"
+    frac = dict((k, v / float(total)) for k, v in c.items())
+    if frac["kana"] > 0.04:
+        return "jpn"
+    # Han with no kana at all is Chinese; Japanese prose essentially
+    # never goes a whole subtitle file without kana.
+    if frac["han"] > 0.20:
+        return "jpn" if c["kana"] else "chi"
+    if frac["hangul"] > 0.20:
+        return "kor"
+    if frac["cyrillic"] > 0.30:
+        return "rus"
+    if frac["arabic"] > 0.30:
+        return "ara"
+    if frac["hebrew"] > 0.30:
+        return "heb"
+    if frac["thai"] > 0.30:
+        return "tha"
+    if frac["greek"] > 0.30:
+        return "ell"
+    if frac["devanagari"] > 0.30:
+        return "hin"
+    if frac["latin"] > 0.60:
+        return "latin"
+    return "unknown"
+
+
+def srt_language(path, max_bytes=400000):
+    """sniff_language() over a subtitle file's TEXT, not its markup.
+
+    Timestamps and cue numbers are stripped first: they are digits and
+    punctuation either way, but leaving them in would put a floor under
+    the character count on a file with almost no dialogue.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError, ValueError):
+        # Only the failures that are genuinely about THIS FILE are
+        # swallowed. A blanket `except Exception` here hid a NameError
+        # for as long as it took to notice every sniff returning
+        # "unknown", which is precisely the silent-no-op shape this
+        # project keeps rediscovering.
+        return "unknown"
+    if len(raw) > max_bytes:
+        raw = raw[:max_bytes]
+    body = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.isdigit() or "-->" in s:
+            continue
+        body.append(s)
+    return sniff_language(" ".join(body))
+
+
 _ARGOS = {}
+
+
+def _argos_pair(at, src_code, tgt):
+    """The installed translation for one DIRECTED pair, or None.
+
+    Not "are both languages installed" - that was the bug. argos lists a
+    language as installed if ANY package mentions it, so with only
+    en->ja present both "en" and "ja" appear installed, and a ja->en
+    lookup sails past the "is it missing" check and then returns None
+    from get_translation.
+
+    Measured on the 2026-08-13 machine: installed languages ['en','ja'],
+    installed pairs en->ja, en->en, ja->ja. ja->en did not exist, was
+    never downloaded because the guard did not notice, and every
+    translation call returned an empty list WITHOUT LOGGING ANYTHING.
+    """
+    langs = at.get_installed_languages()
+    src = next((x for x in langs if x.code == src_code), None)
+    dst = next((x for x in langs if x.code == tgt), None)
+    if not src or not dst:
+        return None
+    try:
+        return src.get_translation(dst) or None
+    except Exception:
+        return None
 
 
 def _translate_argos(lines, target, log=None, source="en"):
@@ -546,14 +730,14 @@ def _translate_argos(lines, target, log=None, source="en"):
     tgt = (target or "").lower()[:2]
     src_code = (source or "en").lower()[:2]
     key = src_code + "->" + tgt
-    tr = _ARGOS.get(key)
-    if tr is None:
+    if key not in _ARGOS:
+        tr = None
         try:
-            langs = at.get_installed_languages()
-            src = next((x for x in langs if x.code == src_code), None)
-            dst = next((x for x in langs if x.code == tgt), None)
-            if not src or not dst:
-                # try to fetch the pair once, then look again
+            # Ask for the PAIR. If it is not installed, install it -
+            # whether or not the two languages happen to appear
+            # elsewhere in the installed set.
+            tr = _argos_pair(at, src_code, tgt)
+            if tr is None:
                 ap.update_package_index()
                 avail = ap.get_available_packages()
                 hit = next((p for p in avail
@@ -561,24 +745,38 @@ def _translate_argos(lines, target, log=None, source="en"):
                             and p.to_code == tgt), None)
                 if hit is None:
                     if log:
-                        log.warning("    argos has no %s->%s model"
+                        log.warning("    argos publishes no %s->%s model, so "
+                                    "this direction cannot be translated"
                                     % (src_code, tgt))
                     _ARGOS[key] = False
                     return []
                 if log:
-                    log.info("    downloading the argos %s->%s model once"
-                             % (src_code, tgt))
+                    log.info("    downloading the argos %s->%s model once "
+                             "(it was not installed)" % (src_code, tgt))
                 ap.install_from_path(hit.download())
-                langs = at.get_installed_languages()
-                src = next((x for x in langs if x.code == src_code), None)
-                dst = next((x for x in langs if x.code == tgt), None)
-            tr = src.get_translation(dst) if src and dst else False
+                tr = _argos_pair(at, src_code, tgt)
+                if tr is None and log:
+                    log.warning("    the argos %s->%s model installed but "
+                                "still does not resolve" % (src_code, tgt))
         except Exception as e:
             if log:
-                log.warning("    argos setup failed: %s" % e)
+                log.warning("    argos setup failed for %s->%s: %s: %s"
+                            % (src_code, tgt, type(e).__name__, e))
             tr = False
-        _ARGOS[key] = tr
+        _ARGOS[key] = tr or False
+        if _ARGOS[key] and log:
+            log.info("    argos %s->%s ready" % (src_code, tgt))
+    tr = _ARGOS[key]
     if not tr:
+        # Said once per pair per run rather than silently. The previous
+        # version returned an empty list here with no message at all, so
+        # the only symptom was the caller reporting "0 lines" over and
+        # over with no cause anywhere in the log.
+        if log and not _ARGOS.get(key + "!said"):
+            _ARGOS[key + "!said"] = True
+            log.warning("    no usable argos %s->%s translator; nothing "
+                        "will be translated in this direction"
+                        % (src_code, tgt))
         return []
     out = []
     for ln in lines:
@@ -657,19 +855,87 @@ def translate_srt(in_srt, out_srt, target, provider, key, endpoint="",
     # then split back out afterwards
     flat = [" ".join(b).replace("\n", " ") for _, _, b in cues]
     done = []
+    ok_lines = 0
+    bad_batches = 0
     for i in range(0, len(flat), batch):
         chunk = flat[i:i + batch]
         got = translate_lines(chunk, target, provider, key, endpoint,
                               model, log, source)
         if len(got) != len(chunk):
+            bad_batches += 1
             if log:
                 log.warning("    translation returned %d lines for %d; "
                             "keeping the original for this batch"
                             % (len(got), len(chunk)))
             got = chunk
+        else:
+            ok_lines += len(chunk)
         done.extend(got)
         if log:
             log.debug("translated %d/%d cues" % (min(i + batch, len(flat)),
                                                  len(flat)))
+
+    # REFUSE TO WRITE AN UNTRANSLATED "TRANSLATION".
+    #
+    # Every failed batch above falls back to the ORIGINAL text, which is
+    # the right thing to do for one batch out of fifty and catastrophic
+    # when it is all of them: the caller labels whatever comes back as
+    # English and muxes it in. On 2026-08-13 argos was returning nothing
+    # for every batch, so two finished films shipped with a full-length
+    # English-tagged subtitle track containing nothing but Japanese.
+    #
+    # Returning None is what the caller already treats as "no translation
+    # available", which leaves the file without an English track rather
+    # than with a lying one.
+    if ok_lines == 0:
+        if log:
+            log.error("    NOTHING was translated - every batch failed. "
+                      "Refusing to write a file that would be tagged %s "
+                      "and contain the untranslated original."
+                      % (target or "?"))
+        return None
+    if bad_batches:
+        frac = 100.0 * ok_lines / max(1, len(flat))
+        if log:
+            log.warning("    only %.0f%% of the cues translated; %d batch(es) "
+                        "kept their original text" % (frac, bad_batches))
+        if frac < 50.0:
+            if log:
+                log.error("    less than half translated; refusing to write "
+                          "it rather than pass it off as %s"
+                          % (target or "?"))
+            return None
+
     new = [(c[0], c[1], [done[n]]) for n, c in enumerate(cues)]
-    return write_srt(new, out_srt)
+    written = write_srt(new, out_srt)
+    if not written:
+        return None
+
+    # VERIFY THE ARTIFACT. Counting successful batches proves the calls
+    # returned something; it does not prove that something is in the
+    # target language. A model that echoes its input, or a provider that
+    # returns the prompt, would pass every check above. Reading the
+    # finished file back and asking what script it is in catches all of
+    # those at once, including whatever the next one turns out to be.
+    want = (target or "").lower()[:2]
+    got_lang = srt_language(written)
+    if want == "en" and got_lang not in ("latin", "unknown"):
+        if log:
+            log.error("    the translated file reads as '%s', not English. "
+                      "Discarding it: a track tagged English has to BE "
+                      "English." % got_lang)
+        try:
+            Path(written).unlink()
+        except OSError:
+            pass
+        return None
+    if want == "ja" and got_lang == "latin":
+        if log:
+            log.error("    the Japanese translation came back in Latin "
+                      "script; discarding it.")
+        try:
+            Path(written).unlink()
+        except OSError:
+            pass
+        return None
+    return written
